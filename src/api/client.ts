@@ -6,6 +6,10 @@ import { buildDispatcher, describeProxy } from "./proxy.js";
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
+  // Keep values as strings: serial numbers have leading zeros and ports/IDs
+  // must not be coerced into lossy numbers.
+  parseTagValue: false,
+  parseAttributeValue: false,
 });
 
 export interface ApiResponse {
@@ -119,14 +123,22 @@ export async function generateApiKey(host: string, username: string, password: s
   }
 }
 
-export async function executeOpCommand(cmd: string, target?: FirewallTarget): Promise<ApiResponse> {
+/**
+ * Run an operational command. When `deviceSerial` is set and `target` is a
+ * Panorama, the command is proxied by Panorama to that managed firewall
+ * (`&target=<serial>`), so a single Panorama API key is enough.
+ */
+export async function executeOpCommand(cmd: string, target?: FirewallTarget, deviceSerial?: string): Promise<ApiResponse> {
   if (!target) {
     const resolved = resolveTarget();
     if (isApiError(resolved)) return resolved;
     target = resolved;
   }
 
-  const url = `https://${target.host}/api/?type=op&cmd=${encodeURIComponent(cmd)}`;
+  let url = `https://${target.host}/api/?type=op&cmd=${encodeURIComponent(cmd)}`;
+  if (deviceSerial) {
+    url += `&target=${encodeURIComponent(deviceSerial)}`;
+  }
 
   try {
     return await makeRequest(url, target.apiKey, target.verifySSL);
@@ -204,6 +216,26 @@ export async function getConfig(xpath: string, target?: FirewallTarget): Promise
   }
 
   const url = `https://${target.host}/api/?type=config&action=get&xpath=${encodeURIComponent(xpath)}`;
+
+  try {
+    return await makeRequest(url, target.apiKey, target.verifySSL);
+  } catch (error) {
+    return {
+      success: false,
+      error: connectError(error),
+    };
+  }
+}
+
+/** Reads the running (committed) configuration, unlike getConfig which reads the candidate. */
+export async function showConfig(xpath: string, target?: FirewallTarget): Promise<ApiResponse> {
+  if (!target) {
+    const resolved = resolveTarget();
+    if (isApiError(resolved)) return resolved;
+    target = resolved;
+  }
+
+  const url = `https://${target.host}/api/?type=config&action=show&xpath=${encodeURIComponent(xpath)}`;
 
   try {
     return await makeRequest(url, target.apiKey, target.verifySSL);
