@@ -237,9 +237,14 @@ export async function scopeForDevice(target: FirewallTarget, serial: string): Pr
   const groups = await listDeviceGroups(target);
   const group = groups.find((g) => g.devices.some((d) => d.serial === serial));
   if (!group) return { locations: ["shared", ...groups.map((g) => g.name)] };
+  return scopeForDeviceGroup(target, group.name);
+}
 
-  const ancestors = (await fetchDgAncestors(target)).get(group.name) ?? [];
-  return { deviceGroup: group.name, locations: ["shared", ...ancestors, group.name] };
+/** Config locations inherited by a device group: shared, its ancestors, then itself. */
+export async function scopeForDeviceGroup(target: FirewallTarget, deviceGroup: string): Promise<DeviceScope> {
+  if (deviceGroup === "shared") return { locations: ["shared"] };
+  const ancestors = (await fetchDgAncestors(target)).get(deviceGroup) ?? [];
+  return { deviceGroup, locations: ["shared", ...ancestors, deviceGroup] };
 }
 
 /** True when a rule's target restriction lets it apply to the given device. */

@@ -10,7 +10,7 @@ export const managedDevice = safeName.describe(
 
 export const deviceGroupFilter = safeName
   .optional()
-  .describe("Device group name, or 'shared'. When omitted, shared and every device group are searched.");
+  .describe("Device group name (includes what it inherits from shared and parent groups), or 'shared'. When omitted, every location is searched.");
 
 export const ipAddress = z
   .string()

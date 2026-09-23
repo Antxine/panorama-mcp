@@ -1,7 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { XMLParser } from "fast-xml-parser";
-import { asArray, jsonResponse, listManagedDevices, locationsToSearch, nodeText, readEntries, resolveDevice } from "../api/panorama.js";
+import { asArray, jsonResponse, listDeviceGroups, listManagedDevices, nodeText, readEntries, resolveDevice } from "../api/panorama.js";
+import { describePick, pickDevice } from "../api/device.js";
+import { resolveScope } from "../api/urlanalysis.js";
 import {
   ipUserMapping,
   op,
@@ -12,7 +14,7 @@ import {
   userGroups,
   xmlLeaf,
 } from "../api/ops.js";
-import { compactRule, fetchRules, ruleAppliesToDevice, scopeForDevice, sortByEvaluationOrder } from "../api/policy.js";
+import { compactRule, fetchDgAncestors, fetchRules, ruleAppliesToDevice, scopeForDevice, sortByEvaluationOrder } from "../api/policy.js";
 import { classifyLogEntry } from "../lib/classify.js";
 import { NO_LOG_HINTS } from "../lib/correlate.js";
 import { ipInEntry } from "../lib/ip.js";
@@ -37,6 +39,12 @@ const panoramaEntry = firewallName.describe(
   "Panorama entry from firewalls.json. Optional when a single Panorama is configured."
 );
 
+const optionalDevice = managedDevice
+  .optional()
+  .describe(
+    "Specific firewall (hostname or serial). Usually omit it: the firewall is chosen from device_group, or from the user's/IP's recent traffic."
+  );
+
 export function registerDebugTools(server: McpServer) {
   server.tool(
     "panorama_list_firewalls",
@@ -54,6 +62,34 @@ export function registerDebugTools(server: McpServer) {
         needle
           ? devices.filter((d) => [d.hostname, d.serial, d.ip, d.model].some((v) => v.toLowerCase().includes(needle)))
           : devices
+      );
+    }
+  );
+
+  server.tool(
+    "panorama_list_device_groups",
+    "[READ-ONLY] Lists device groups with their parent chain and member firewalls (hostname, serial, connected). Policies of a device group include everything inherited from shared and its parents.",
+    {
+      refresh: z.boolean().optional().describe("Bypass the 5-minute cache"),
+      firewall: panoramaEntry,
+    },
+    { title: "List Device Groups", ...READ_ONLY },
+    async ({ refresh, firewall }) => {
+      const target = panoramaTarget(firewall);
+      const [groups, devices, ancestors] = await Promise.all([
+        listDeviceGroups(target, refresh),
+        listManagedDevices(target, refresh),
+        fetchDgAncestors(target),
+      ]);
+      return jsonResponse(
+        groups.map((g) => ({
+          device_group: g.name,
+          inherits_from: ["shared", ...(ancestors.get(g.name) ?? [])],
+          firewalls: g.devices.map((d) => {
+            const dev = devices.find((x) => x.serial === d.serial);
+            return { hostname: dev?.hostname || d.hostname, serial: d.serial, connected: dev?.connected ?? false, policy_sync: dev?.policySync };
+          }),
+        }))
       );
     }
   );
@@ -104,17 +140,19 @@ export function registerDebugTools(server: McpServer) {
     "userid_lookup",
     "[READ-ONLY] User-ID state on a managed firewall: which user is mapped to an IP (show user ip-user-mapping) and/or which groups a user belongs to (show user user-ids match-user). A missing mapping means user/group-based rules cannot match that IP.",
     {
-      device: managedDevice,
       ip: ipAddress.optional(),
       user: userName.optional(),
+      device: optionalDevice,
+      device_group: deviceGroupFilter,
       firewall: panoramaEntry,
     },
     { title: "User-ID Lookup", ...READ_ONLY },
-    async ({ device, ip, user, firewall }) => {
+    async ({ device, device_group, ip, user, firewall }) => {
       if (!ip && !user) throw new Error("Provide 'ip' and/or 'user'");
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
-      const out: Record<string, unknown> = { device: `${dev.hostname} (${dev.serial})` };
+      const pick = await pickDevice(target, { device, device_group, src_ip: ip, user });
+      const dev = pick.device;
+      const out: Record<string, unknown> = { firewall_used: describePick(pick) };
       if (ip) {
         const mapping = await ipUserMapping(target, dev.serial, ip);
         out.ip_user_mapping = mapping.length ? mapping : `No User-ID mapping for ${ip}`;
@@ -129,21 +167,23 @@ export function registerDebugTools(server: McpServer) {
     "gp_current_users",
     "[READ-ONLY] GlobalProtect users currently connected to a gateway firewall (show global-protect-gateway current-user), optionally for one user.",
     {
-      device: managedDevice,
       user: userName.optional(),
+      device: optionalDevice.describe("GlobalProtect gateway firewall. Inferred from the user's traffic when omitted."),
+      device_group: deviceGroupFilter,
       firewall: panoramaEntry,
     },
     { title: "GlobalProtect Current Users", ...READ_ONLY },
-    async ({ device, user, firewall }) => {
+    async ({ device, device_group, user, firewall }) => {
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
+      const pick = await pickDevice(target, { device, device_group, user });
+      const dev = pick.device;
       const data = await op(
         target,
         `<show><global-protect-gateway><current-user>${xmlLeaf("user", user)}</current-user></global-protect-gateway></show>`,
         dev.serial
       );
       const entries = asArray(data?.entry);
-      return jsonResponse({ device: dev.hostname, count: entries.length, users: entries });
+      return jsonResponse({ firewall_used: describePick(pick), count: entries.length, users: entries });
     }
   );
 
@@ -151,7 +191,8 @@ export function registerDebugTools(server: McpServer) {
     "test_security_policy_match",
     "[READ-ONLY] Asks a managed firewall which security rule matches a flow (test security-policy-match). This is the ground truth, including local rules invisible from Panorama. Include source_user so user/group-based rules are evaluated.",
     {
-      device: managedDevice,
+      device: optionalDevice,
+      device_group: deviceGroupFilter,
       source: ipAddress.describe("Source IP"),
       destination: ipAddress.describe("Destination IP (pre-NAT)"),
       destination_port: port,
@@ -165,11 +206,11 @@ export function registerDebugTools(server: McpServer) {
       firewall: panoramaEntry,
     },
     { title: "Test Security Policy Match", ...READ_ONLY },
-    async ({ device, firewall, protocol, ...input }) => {
+    async ({ device, device_group, firewall, protocol, ...input }) => {
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
-      const rules = await testSecurityPolicyMatch(target, dev.serial, { ...input, protocol: protocol ?? 6 });
-      return jsonResponse({ device: dev.hostname, matching_rules: rules.length ? rules : "No rule matched (default rules apply)" });
+      const pick = await pickDevice(target, { device, device_group, src_ip: input.source });
+      const rules = await testSecurityPolicyMatch(target, pick.device.serial, { ...input, protocol: protocol ?? 6 });
+      return jsonResponse({ firewall_used: describePick(pick), matching_rules: rules.length ? rules : "No rule matched (default rules apply)" });
     }
   );
 
@@ -177,15 +218,16 @@ export function registerDebugTools(server: McpServer) {
     "test_url_category",
     "[READ-ONLY] Asks a managed firewall how it categorizes a URL (test url): PAN-DB categories from the local cache and the cloud. Custom categories are not shown here: use url_category_find.",
     {
-      device: managedDevice,
       url: urlInput,
+      device: optionalDevice.describe("Firewall to ask. Any connected firewall when omitted (PAN-DB is the same everywhere)."),
+      device_group: deviceGroupFilter,
       firewall: panoramaEntry,
     },
     { title: "Test URL Category", ...READ_ONLY },
-    async ({ device, url, firewall }) => {
+    async ({ device, device_group, url, firewall }) => {
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
-      return jsonResponse({ device: dev.hostname, ...(await testUrl(target, dev.serial, url)) });
+      const pick = await pickDevice(target, { device, device_group, anyConnected: true });
+      return jsonResponse({ firewall_used: describePick(pick), ...(await testUrl(target, pick.device.serial, url)) });
     }
   );
 
@@ -193,7 +235,8 @@ export function registerDebugTools(server: McpServer) {
     "show_sessions",
     "[READ-ONLY] Active sessions on a managed firewall matching a filter (show session all filter). Useful while the user reproduces the issue.",
     {
-      device: managedDevice,
+      device: optionalDevice,
+      device_group: deviceGroupFilter,
       source: ipAddress.optional(),
       destination: ipAddress.optional(),
       destination_port: port.optional(),
@@ -202,10 +245,11 @@ export function registerDebugTools(server: McpServer) {
       firewall: panoramaEntry,
     },
     { title: "Show Sessions", ...READ_ONLY },
-    async ({ device, source, destination, destination_port, application, max_results, firewall }) => {
+    async ({ device, device_group, source, destination, destination_port, application, max_results, firewall }) => {
       if (!source && !destination) throw new Error("Provide at least 'source' or 'destination'");
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
+      const pick = await pickDevice(target, { device, device_group, src_ip: source });
+      const dev = pick.device;
       const filter =
         xmlLeaf("source", source) +
         xmlLeaf("destination", destination) +
@@ -213,17 +257,17 @@ export function registerDebugTools(server: McpServer) {
         xmlLeaf("application", application);
       const data = await op(target, `<show><session><all><filter>${filter}</filter></all></session></show>`, dev.serial);
       const entries = asArray(data?.entry);
-      return jsonResponse({ device: dev.hostname, total: entries.length, sessions: entries.slice(0, max_results ?? 50) });
+      return jsonResponse({ firewall_used: describePick(pick), total: entries.length, sessions: entries.slice(0, max_results ?? 50) });
     }
   );
 
   server.tool(
     "find_security_rules",
-    "[READ-ONLY] Searches security or decryption rules (pre/post) in Panorama's running config. Matches 'contains' against rule name, zones, addresses, users, applications, services, categories, tags and description. With 'device', only rules applying to that firewall are returned, in evaluation order. Output flags rules without log forwarding.",
+    "[READ-ONLY] Searches security or decryption rules (pre/post) in Panorama's running config. Matches 'contains' against rule name, zones, addresses, users, applications, services, categories, tags and description. With 'device_group', rules of that group AND everything it inherits (shared, parent groups) are returned in evaluation order; with 'device', only rules applying to that firewall. Output flags rules without log forwarding.",
     {
       contains: z.string().max(127).optional().describe("Case-insensitive text to look for (object, user, group, app, category, rule name...)"),
-      device: managedDevice.optional(),
       device_group: deviceGroupFilter,
+      device: optionalDevice,
       policy: z.enum(["security", "decryption"]).optional().describe("Default: security"),
       include_disabled: z.boolean().optional(),
       max_results: maxResults,
@@ -232,15 +276,8 @@ export function registerDebugTools(server: McpServer) {
     { title: "Find Security Rules", ...READ_ONLY },
     async ({ contains, device, device_group, policy, include_disabled, max_results, firewall }) => {
       const target = panoramaTarget(firewall);
-      let locations: string[];
-      let serial: string | undefined;
-      if (device) {
-        const dev = await resolveDevice(target, device);
-        serial = dev.serial;
-        locations = (await scopeForDevice(target, dev.serial)).locations;
-      } else {
-        locations = await locationsToSearch(target, device_group);
-      }
+      const scope = await resolveScope(target, device, device_group);
+      const { locations, ruleSerial: serial } = scope;
       const needle = contains?.toLowerCase();
       let rules = await fetchRules(target, locations, [policy ?? "security"]);
       rules = rules.filter((r) => (include_disabled || !r.disabled) && ruleAppliesToDevice(r, serial));
@@ -250,9 +287,10 @@ export function registerDebugTools(server: McpServer) {
             .some((v) => v.toLowerCase().includes(needle))
         );
       }
-      if (device) rules = sortByEvaluationOrder(rules, locations);
+      if (device || device_group) rules = sortByEvaluationOrder(rules, locations);
       return jsonResponse({
         scope: locations,
+        ...(scope.deviceDescription ? { firewall_used: scope.deviceDescription } : {}),
         total: rules.length,
         rules: rules.slice(0, max_results ?? 50).map(compactRule),
         note: "Panorama running config. Local firewall rules and unpushed changes are not included.",
@@ -264,15 +302,17 @@ export function registerDebugTools(server: McpServer) {
     "edl_lookup",
     "[READ-ONLY] Checks whether an IP, domain or URL is present in the External Dynamic Lists applying to a firewall (config from Panorama, current content from the firewall), including EDL exception lists.",
     {
-      device: managedDevice,
+      device: optionalDevice,
+      device_group: deviceGroupFilter,
       value: z.string().min(1).max(2048).regex(/^[^\s'"<>]+$/).describe("IP, domain or URL to look for"),
       name: z.string().max(63).regex(/^[^'"<>]+$/).optional().describe("Only this EDL"),
       firewall: panoramaEntry,
     },
     { title: "EDL Lookup", ...READ_ONLY },
-    async ({ device, value, name, firewall }) => {
+    async ({ device, device_group, value, name, firewall }) => {
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
+      const pick = await pickDevice(target, { device, device_group, anyConnected: true });
+      const dev = pick.device;
       const { locations } = await scopeForDevice(target, dev.serial);
       const valueKind = /^[0-9.:/-]+$/.test(value) ? "ip" : value.includes("/") ? "url" : "domain";
 
@@ -336,7 +376,7 @@ export function registerDebugTools(server: McpServer) {
         });
       }
       return jsonResponse({
-        device: dev.hostname,
+        firewall_used: describePick(pick),
         value,
         value_type: valueKind,
         edls_checked: results,

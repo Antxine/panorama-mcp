@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { FirewallTarget } from "../api/client.js";
 import { jsonResponse, nodeText, resolveDevice } from "../api/panorama.js";
+import { describePick, pickDevice } from "../api/device.js";
 import { ipUserMapping, logTime, panoramaTarget, searchLogs, testSecurityPolicyMatch, userGroups } from "../api/ops.js";
 import {
   compactRule,
@@ -20,7 +21,7 @@ import { groupEvents, NO_LOG_HINTS, reportedSiteFindings, type LogEvent } from "
 import { trimLogEntry, type LogFilters, type LogPeriod, type LogType } from "../lib/logquery.js";
 import { baseDomain, hostOf, normalizeUrl } from "../lib/urlmatch.js";
 import { firewallName } from "../schemas/panos.js";
-import { ipAddress, logPeriod, managedDevice, port, urlInput, userName } from "../schemas/debug.js";
+import { deviceGroupFilter, ipAddress, logPeriod, managedDevice, port, urlInput, userName } from "../schemas/debug.js";
 import { PLAYBOOK, SERVER_INSTRUCTIONS, TICKET_METHOD } from "../playbook.js";
 import { READ_ONLY } from "./debug.js";
 
@@ -157,23 +158,24 @@ export function registerDiagnoseTools(server: McpServer) {
     "[READ-ONLY] Full analysis of why a URL is blocked/allowed: existing custom categories covering it (or same-domain entries that do not match), PAN-DB category, rules and URL filtering profiles using those categories, recent URL logs for the user, and conclusions. Prevents proposing a category that already exists.",
     {
       url: urlInput,
-      device: managedDevice.optional().describe("Firewall the user goes through. Inferred from logs when omitted and user/src_ip is given."),
       user: userName.optional(),
       src_ip: ipAddress.optional(),
+      device_group: deviceGroupFilter.describe("Device group of the user's site. Inferred from the user's logs when omitted."),
+      device: managedDevice.optional().describe("Specific firewall; usually omit it."),
       period: logPeriod,
       firewall: panoramaEntry,
     },
     { title: "Diagnose URL Access", ...READ_ONLY },
-    async ({ url, device, user, src_ip, period, firewall }) => {
+    async ({ url, device, device_group, user, src_ip, period, firewall }) => {
       const target = panoramaTarget(firewall);
       const host = hostOf(normalizeUrl(url));
 
       const logs = await searchLogs(target, "url", { user, src_ip, url_contains: host, period: period ?? "last-24-hrs" }, 20).catch(
         (err) => ({ query: "", entries: [] as Record<string, any>[], matched: 0, error: errMsg(err) })
       );
-      if (!device && logs.entries[0]?.serial) device = nodeText(logs.entries[0].serial);
+      if (!device && !device_group && logs.entries[0]?.serial) device = nodeText(logs.entries[0].serial);
 
-      const scope = await resolveScope(target, device);
+      const scope = await resolveScope(target, device, device_group, { src_ip, user, anyConnected: true });
       const analysis = await analyzeUrl(target, url, scope);
       const usage = await categoryUsage(target, analysis.effectiveCategories, scope);
       const findings = urlFindings(analysis, usage, scope);
@@ -196,7 +198,7 @@ export function registerDiagnoseTools(server: McpServer) {
 
       return jsonResponse({
         url,
-        device: scope.device ? `${scope.device.hostname} (${scope.device.serial})` : undefined,
+        firewall_used: scope.deviceDescription,
         scope: scope.locations,
         findings,
         custom_categories: { covered_by: analysis.covering, category_match: analysis.categoryMatch, same_domain_not_matching: analysis.related },
@@ -354,7 +356,8 @@ export function registerDiagnoseTools(server: McpServer) {
     "diagnose_flow",
     "[READ-ONLY] Analyzes a flow (source -> destination:port) on a firewall: User-ID mapping and groups of the source, rule the firewall actually matches (test security-policy-match with the user), rules allowing the requested application, and recent traffic logs explained. Use for 'no rule allows X', upload app functions, App-ID or network issues.",
     {
-      device: managedDevice,
+      device: managedDevice.optional().describe("Specific firewall; usually omit it (inferred from the source's traffic or device_group)."),
+      device_group: deviceGroupFilter,
       destination: ipAddress.describe("Destination IP (pre-NAT)"),
       destination_port: port,
       protocol: z.number().int().min(0).max(255).optional().describe("Default 6 (TCP)"),
@@ -365,12 +368,11 @@ export function registerDiagnoseTools(server: McpServer) {
       firewall: panoramaEntry,
     },
     { title: "Diagnose Flow", ...READ_ONLY },
-    async ({ device, destination, destination_port, protocol, src_ip, user, application, period, firewall }) => {
+    async ({ device, device_group, destination, destination_port, protocol, src_ip, user, application, period, firewall }) => {
       if (!src_ip && !user) throw new Error("Provide 'src_ip' and/or 'user'");
       const target = panoramaTarget(firewall);
-      const dev = await resolveDevice(target, device);
       const findings: string[] = [];
-      const out: Record<string, unknown> = { device: `${dev.hostname} (${dev.serial})` };
+      const out: Record<string, unknown> = {};
       const time = { period: period ?? ("last-24-hrs" as LogPeriod) };
 
       if (!src_ip && user) {
@@ -381,6 +383,10 @@ export function registerDiagnoseTools(server: McpServer) {
         if (!src_ip) throw new Error(`No traffic log for user '${user}' in ${time.period}: provide src_ip`);
         findings.push(`Source IP inferred from traffic logs: ${src_ip}${counts.size > 1 ? ` (other IPs seen: ${[...counts.keys()].filter((k) => k !== src_ip).join(", ")})` : ""}.`);
       }
+
+      const pick = await pickDevice(target, { device, device_group, src_ip, user });
+      const dev = pick.device;
+      out.firewall_used = describePick(pick);
 
       const mapping = await ipUserMapping(target, dev.serial, src_ip!).catch((err) => errMsg(err));
       out.user_id_mapping = mapping;

@@ -1,5 +1,6 @@
 import type { FirewallTarget } from "./client.js";
-import { locationsToSearch, resolveDevice, type ManagedDevice } from "./panorama.js";
+import { locationsToSearch, type ManagedDevice } from "./panorama.js";
+import { describePick, pickDevice, type DeviceHints } from "./device.js";
 import { testUrl } from "./ops.js";
 import {
   compactRule,
@@ -10,6 +11,7 @@ import {
   fetchUrlFilteringProfiles,
   ruleAppliesToDevice,
   scopeForDevice,
+  scopeForDeviceGroup,
   sortByEvaluationOrder,
   type CustomUrlCategory,
   type RuleSummary,
@@ -17,18 +19,40 @@ import {
 import { matchEntries } from "../lib/urlmatch.js";
 
 export interface Scope {
+  /** Firewall used for live lookups (PAN-DB, User-ID...), when one could be chosen. */
   device?: ManagedDevice;
+  deviceDescription?: string;
+  /** Set when the analysis is for one specific firewall: rules targeting other firewalls are ignored. */
+  ruleSerial?: string;
   deviceGroup?: string;
+  /** Config locations in inheritance order (shared -> ancestors -> device group). */
   locations: string[];
 }
 
-export async function resolveScope(target: FirewallTarget, device?: string, deviceGroup?: string): Promise<Scope> {
-  if (device) {
-    const dev = await resolveDevice(target, device);
-    const scope = await scopeForDevice(target, dev.serial);
-    return { device: dev, ...scope };
+/**
+ * Config scope of an analysis. A device group is read with everything it inherits;
+ * a firewall (explicit or inferred from the user's logs) with the chain of its device group.
+ * `live` lets a firewall be picked for live lookups even when reasoning per device group.
+ */
+export async function resolveScope(
+  target: FirewallTarget,
+  device?: string,
+  deviceGroup?: string,
+  live: Omit<DeviceHints, "device" | "device_group"> = {}
+): Promise<Scope> {
+  if (device || (!deviceGroup && (live.src_ip || live.user))) {
+    const pick = await pickDevice(target, { device, ...live }).catch(() => undefined);
+    if (pick) {
+      const scope = await scopeForDevice(target, pick.device.serial);
+      return { device: pick.device, deviceDescription: describePick(pick), ruleSerial: pick.device.serial, ...scope };
+    }
+    if (device) await pickDevice(target, { device }); // rethrow the explicit-device error
   }
-  return { deviceGroup, locations: await locationsToSearch(target, deviceGroup) };
+
+  const base = deviceGroup ? await scopeForDeviceGroup(target, deviceGroup) : { locations: await locationsToSearch(target) };
+  if (!deviceGroup && !live.anyConnected) return base;
+  const pick = await pickDevice(target, { device_group: deviceGroup, anyConnected: live.anyConnected }).catch(() => undefined);
+  return { ...base, device: pick?.device, deviceDescription: pick ? describePick(pick) : undefined };
 }
 
 export interface CategoryHit {
@@ -121,7 +145,7 @@ export async function categoryUsage(
     fetchUrlFilteringProfiles(target, scope.locations),
     fetchProfileGroups(target, scope.locations),
   ]);
-  const serial = scope.device?.serial;
+  const serial = scope.ruleSerial;
   const applicable = rules.filter((r) => ruleAppliesToDevice(r, serial));
   const wanted = new Set(categories);
 

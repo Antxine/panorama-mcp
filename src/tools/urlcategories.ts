@@ -57,17 +57,18 @@ export function registerUrlCategoryTools(server: McpServer) {
     "[READ-ONLY] Finds which existing custom URL categories already cover a URL (PAN-OS wildcard/prefix rules), which ones contain the same domain but do not match (pattern issue), and with 'device' the PAN-DB category. Run this BEFORE proposing any new URL category.",
     {
       url: urlInput,
-      device: managedDevice.optional().describe("Managed firewall: restricts to the categories applying to it and adds its PAN-DB lookup"),
-      device_group: deviceGroupFilter,
+      device_group: deviceGroupFilter.describe("Device group: its categories plus those inherited from shared/parents. All locations when omitted."),
+      device: managedDevice.optional().describe("Specific firewall; usually omit it"),
       firewall: panoramaEntry,
     },
     { title: "Find URL in Categories", ...READ_ONLY },
     async ({ url, device, device_group, firewall }) => {
       const target = panoramaTarget(firewall);
-      const scope = await resolveScope(target, device, device_group);
+      const scope = await resolveScope(target, device, device_group, { anyConnected: true });
       const analysis = await analyzeUrl(target, url, scope);
       return jsonResponse({
         scope: scope.locations,
+        firewall_used_for_pan_db: scope.deviceDescription,
         covered_by: analysis.covering,
         category_match: analysis.categoryMatch,
         same_domain_not_matching: analysis.related,
