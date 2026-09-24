@@ -19,6 +19,7 @@ import {
   type RuleSummary,
 } from "./policy.js";
 import { matchEntries } from "../lib/urlmatch.js";
+import { matchSourceUser, type Membership } from "../lib/groups.js";
 
 export interface Scope {
   /** Firewall used for live lookups (PAN-DB, User-ID...), when one could be chosen. */
@@ -198,7 +199,7 @@ export async function categoryUsage(
 }
 
 /** Deterministic conclusions for a URL, so the model does not suggest duplicating existing config. */
-export function urlFindings(analysis: UrlAnalysis, usage: CategoryUsage, scope: Scope): string[] {
+export function urlFindings(analysis: UrlAnalysis, usage: CategoryUsage, scope: Scope, membership?: Membership): string[] {
   const f: string[] = [];
   const customNames = [...analysis.covering, ...analysis.categoryMatch].map((c) => c.category);
 
@@ -247,7 +248,7 @@ export function urlFindings(analysis: UrlAnalysis, usage: CategoryUsage, scope: 
   for (const r of usage.rules) {
     const issues: string[] = [];
     if (r.disabled) issues.push("rule is DISABLED");
-    if (r.sourceUser.length && !r.sourceUser.includes("any")) issues.push(`only for users/groups ${r.sourceUser.join(", ")}: check the user's group membership`);
+    if (r.sourceUser.length && !r.sourceUser.includes("any")) issues.push(describeUserRestriction(r.sourceUser, membership));
     if (r.schedule) issues.push(`has schedule '${r.schedule}'`);
     if (r.policy === "decryption") issues.push("decryption rule (does not allow/deny by itself)");
     f.push(`Rule '${r.name}' (${r.location}/${r.rulebase}, action ${r.action}) references ${r.category.filter((c) => analysis.effectiveCategories.includes(c)).join(", ")}${issues.length ? `: ${issues.join("; ")}` : ""}.`);
@@ -279,4 +280,15 @@ export function summarizeUsage(usage: CategoryUsage) {
     rules: usage.rules.map(compactRule),
     url_filtering_profiles: usage.profiles,
   };
+}
+
+/** "only for X, Y: the user IS a member (via X)" style explanation of a rule's source_user. */
+export function describeUserRestriction(sourceUser: string[], membership?: Membership): string {
+  const shown = sourceUser.length > 6 ? `${sourceUser.slice(0, 6).join(", ")} (+${sourceUser.length - 6})` : sourceUser.join(", ");
+  if (!membership) return `only for users/groups ${shown}: check the user's group membership (ad_user_rules)`;
+  const m = matchSourceUser(sourceUser, membership);
+  if (m.unrestricted) return `source_user ${shown} does not restrict by identity`;
+  return m.matchedBy.length
+    ? `applies to the user (matched by ${m.matchedBy.join(", ")})`
+    : `does NOT apply to the user: not in ${shown} (per AD, including nested groups)`;
 }

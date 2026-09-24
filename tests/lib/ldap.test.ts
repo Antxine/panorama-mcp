@@ -48,3 +48,13 @@ describe("identities", () => {
     expect(cnOf("CN=ACC\\, Comms,OU=G,DC=corp")).toBe("ACC, Comms");
   });
 });
+
+describe("AD PowerShell script", async () => {
+  const { AD_SCRIPT } = await import("../../src/api/ad.js");
+  it("escapes the user DN for the nested-group filter with single backslashes", () => {
+    expect(AD_SCRIPT).toContain("-replace '\\\\', '\\5c' -replace '\\*', '\\2a' -replace '\\(', '\\28' -replace '\\)', '\\29'");
+  });
+  it("reads the filter from the environment, never from interpolated input", () => {
+    expect(AD_SCRIPT).toContain("$s.Filter = $env:PANOS_MCP_LDAP_FILTER");
+  });
+});

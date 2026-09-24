@@ -43,7 +43,8 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
   - Citrix and AD-mapped users are logged as DOMAIN\\id (for example emea\\u123456) behind shared Citrix IPs.
   - ad_lookup_user (when available) turns an email or display name into every log identity and lists the user's AD groups; diagnose_user_blocks uses it automatically.
   - Without AD, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
-- Group-based rules: compare the rule's source_user groups with the user's AD groups before concluding a rule should match.
+- Group-based rules: ad_user_rules lists the rules targeting the user through their AD groups (nested included) and, with 'contains', the relevant rules reserved to other groups with the group the user lacks. The usual fix is then adding the user to the existing group (identity team), not a new rule.
+- Groups in rules may come from the Cloud Identity Engine (Entra DN like CN=...,DC=tenant,DC=onmicrosoft,DC=com); cloud-only groups are not visible in on-prem AD.
 
 ## Third-party dependencies (ABC.com works but upload fails)
 - Web apps call other domains for uploads, storage, APIs, CDN, auth: S3, Azure Blob, GCS, CloudFront, Akamai, SharePoint, OneDrive, Box, Dropbox, and Okta/Entra ID for SSO.

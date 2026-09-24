@@ -6,7 +6,7 @@ import { buildUserFilter, cnOf, logIdentities, type AdUser } from "../lib/ldap.j
  * domain credentials. The LDAP filter is passed through an environment variable, never
  * interpolated into the script, so user input cannot inject PowerShell.
  */
-const SCRIPT = `
+export const AD_SCRIPT = `
 $ErrorActionPreference = 'Stop'
 $props = 'samaccountname','userprincipalname','mail','displayname','distinguishedname','memberof','department','company','useraccountcontrol'
 function Find-Users([string]$root) {
@@ -39,7 +39,21 @@ $results = @($found | ForEach-Object {
     memberOf = @($p['memberof'] | ForEach-Object { [string]$_ })
   }
 })
-[pscustomobject]@{ source = $source; results = $results } | ConvertTo-Json -Depth 4 -Compress
+# Nested membership (LDAP_MATCHING_RULE_IN_CHAIN): memberOf only lists direct groups.
+$nested = @()
+if ($results.Count -eq 1 -and $results[0].dn) {
+  try {
+    $dn = $results[0].dn -replace '\\\\', '\\5c' -replace '\\*', '\\2a' -replace '\\(', '\\28' -replace '\\)', '\\29'
+    $g = New-Object DirectoryServices.DirectorySearcher
+    if ($source -eq 'global-catalog') { $g.SearchRoot = [ADSI]"GC://$forest" }
+    $g.Filter = "(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=$dn))"
+    $g.PageSize = 500
+    $g.ClientTimeout = [TimeSpan]::FromSeconds(10)
+    [void]$g.PropertiesToLoad.Add('distinguishedname')
+    $nested = @($g.FindAll() | ForEach-Object { [string]($_.Properties['distinguishedname'] | Select-Object -First 1) })
+  } catch { }
+}
+[pscustomobject]@{ source = $source; results = $results; nested = $nested } | ConvertTo-Json -Depth 4 -Compress
 `;
 
 export function adLookupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -51,7 +65,7 @@ export function adLookupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 
 export interface AdLookupResult {
   source: string;
-  users: Array<AdUser & { log_identities: string[] }>;
+  users: Array<AdUser & { log_identities: string[]; direct_group_count: number }>;
 }
 
 export async function adLookupUser(input: string): Promise<AdLookupResult> {
@@ -61,17 +75,20 @@ export async function adLookupUser(input: string): Promise<AdLookupResult> {
     execFile(
       "powershell.exe",
       // -EncodedCommand (UTF-16LE base64) avoids Windows command-line quoting issues with the script.
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(SCRIPT, "utf16le").toString("base64")],
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(AD_SCRIPT, "utf16le").toString("base64")],
       { env: { ...process.env, PANOS_MCP_LDAP_FILTER: filter }, timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
       (err, out, stderr) => (err ? reject(new Error(`AD lookup failed: ${stderr?.trim() || err.message}`)) : resolve(out))
     );
   });
   const parsed = JSON.parse(stdout.trim() || '{"source":"domain","results":[]}');
   const rows: any[] = Array.isArray(parsed.results) ? parsed.results : parsed.results ? [parsed.results] : [];
+  const nested: string[] = Array.isArray(parsed.nested) ? parsed.nested : parsed.nested ? [parsed.nested] : [];
   return {
     source: parsed.source,
     users: rows.map((r) => {
-      const groupDns: string[] = Array.isArray(r.memberOf) ? r.memberOf : r.memberOf ? [r.memberOf] : [];
+      const direct: string[] = Array.isArray(r.memberOf) ? r.memberOf : r.memberOf ? [r.memberOf] : [];
+      // Nested groups are resolved for single matches only; they include the direct ones.
+      const groupDns = rows.length === 1 && nested.length ? [...new Set([...direct, ...nested])] : direct;
       const user: AdUser = {
         sam: r.sam ?? "",
         upn: r.upn ?? "",
@@ -85,7 +102,16 @@ export async function adLookupUser(input: string): Promise<AdLookupResult> {
         groups: groupDns.map(cnOf),
         groupDns,
       };
-      return { ...user, log_identities: logIdentities(user) };
+      return { ...user, direct_group_count: direct.length, log_identities: logIdentities(user) };
     }),
   };
+}
+
+/** Identities and groups of a single AD user, for matching rules' source_user; undefined when unknown or ambiguous. */
+export async function adMembership(user: string): Promise<{ user: AdLookupResult["users"][number]; identities: string[]; groups: string[] } | undefined> {
+  if (!adLookupEnabled()) return undefined;
+  const result = await adLookupUser(user);
+  if (result.users.length !== 1) return undefined;
+  const u = result.users[0];
+  return { user: u, identities: u.log_identities, groups: u.groupDns };
 }

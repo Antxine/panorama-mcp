@@ -76,6 +76,8 @@ PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la so
 
 Sur un PC Windows du domaine, l'outil `ad_lookup_user` interroge l'Active Directory avec ta session. À partir d'un e-mail, d'un `DOMAINE\id` ou d'un « Prénom Nom », il renvoie le compte, les groupes AD et les identités telles qu'elles apparaissent dans les logs. `diagnose_user_blocks` s'en sert automatiquement : avec un e-mail, il cherche les logs sous l'UPN **et** sous `DOMAINE\id`.
 
+L'outil `ad_user_rules` croise les groupes AD de l'utilisateur, groupes imbriqués compris, avec le `source_user` des règles. Il liste les règles qui le visent déjà, et par quel groupe. Avec `contains` (application, catégorie…), il liste aussi les règles pertinentes réservées à d'autres groupes, avec le groupe qui lui manque. Souvent, la bonne correction est alors d'**ajouter l'utilisateur au groupe existant**, pas de créer une règle. Les groupes Entra ID purement cloud (Cloud Identity Engine) ne sont pas visibles dans l'AD on-prem.
+
 Sans AD, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le site demandé (`reported_url`) : l'outil liste les identités vues pour cette URL.
 
 ## Variables d'environnement

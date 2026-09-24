@@ -4,7 +4,8 @@ import type { FirewallTarget } from "../api/client.js";
 import { jsonResponse, nodeText, resolveDevice } from "../api/panorama.js";
 import { describePick, originOf, pickDevice } from "../api/device.js";
 import { containersOf, fetchAppContainers, predefinedApp } from "../api/apps.js";
-import { adLookupEnabled, adLookupUser } from "../api/ad.js";
+import { adLookupEnabled, adLookupUser, adMembership } from "../api/ad.js";
+import { describeUserRestriction } from "../api/urlanalysis.js";
 import { ipUserMapping, logTime, panoramaTarget, searchLogs, testSecurityPolicyMatch, userGroups } from "../api/ops.js";
 import {
   appFamily,
@@ -284,7 +285,8 @@ export function registerDiagnoseTools(server: McpServer) {
       const loggedCategories = [...new Set(logs.entries.flatMap((e) => (nodeText(e.url_category_list) || nodeText(e.category)).split(",")).map((c) => c.trim()).filter(Boolean))];
       const categories = [...new Set([...analysis.effectiveCategories, ...loggedCategories])];
       const usage = await categoryUsage(target, categories, scope);
-      findings.push(...urlFindings(analysis, usage, scope));
+      const membership = user ? await adMembership(user).catch(() => undefined) : undefined;
+      findings.push(...urlFindings(analysis, usage, scope, membership));
 
       const loggedCustom = loggedCategories.filter((c) => /[A-Z ]/.test(c) && !analysis.covering.some((x) => x.category === c));
       if (loggedCustom.length) {
@@ -314,6 +316,9 @@ export function registerDiagnoseTools(server: McpServer) {
       const exceptions = findExceptionRules(usage.allRules, { categories: customCats }, blockingRule);
       const pattern = exceptionPattern(exceptions);
       if (pattern) findings.push(pattern);
+      if (membership) {
+        for (const r of exceptions) findings.push(`Exception rule '${r.name}': ${describeUserRestriction(r.sourceUser, membership)}.`);
+      }
       if (blockingRule) {
         findings.push(
           `The enforcing rule '${blockingRule.name}' is in ${blockingRule.location}/${blockingRule.rulebase} #${blockingRule.position}: an exception rule must be placed before it, in the same device group (or a parent evaluated earlier).`
@@ -584,6 +589,12 @@ export function registerDiagnoseTools(server: McpServer) {
         }
         const allowing = relevant.filter((r) => r.action === "allow" && r.application.some((a) => names.has(a)));
         if (!allowing.length) findings.push(`No enabled rule in scope explicitly allows '${application}' (directly or via a group/filter).`);
+        const membership = user ? await adMembership(user).catch(() => undefined) : undefined;
+        for (const r of allowing.slice(0, 5)) {
+          if (r.sourceUser.length && !r.sourceUser.includes("any")) {
+            findings.push(`Allow rule '${r.name}' ${describeUserRestriction(r.sourceUser, membership)}.`);
+          }
+        }
 
         const exceptions = findExceptionRules(rules, { apps: [application] }, denying[0]);
         out.existing_exception_rules = exceptions.map(compactRule);
