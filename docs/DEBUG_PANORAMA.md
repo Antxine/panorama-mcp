@@ -74,7 +74,7 @@ Le modèle suit cette méthode :
 
 PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la source :
 - GlobalProtect et Prisma Access : UPN (`prenom.nom@domaine`, souvent `nom-external@domaine` pour les externes) ;
-- Citrix et AD : `DOMAINE\id` (par exemple `emea\u123456`), derrière des IP Citrix partagées.
+- Citrix et AD : `DOMAINE\id` (par exemple `corp\u123456`), derrière des IP Citrix partagées.
 
 Sur un PC Windows du domaine, l'outil `ad_lookup_user` interroge l'Active Directory avec ta session. À partir d'un e-mail, d'un `DOMAINE\id` ou d'un « Prénom Nom », il renvoie le compte, les groupes AD et les identités telles qu'elles apparaissent dans les logs. `diagnose_user_blocks` s'en sert automatiquement : avec un e-mail, il cherche les logs sous l'UPN **et** sous `DOMAINE\id`.
 

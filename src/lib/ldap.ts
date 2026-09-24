@@ -30,7 +30,7 @@ export function buildUserFilter(input: string): string {
   return `(&${PERSON}(|(displayName=*${full}*)(&(givenName=${a}*)(sn=${b}*))(&(givenName=${b}*)(sn=${a}*))))`;
 }
 
-/** NetBIOS-style domain guess from a DN: "CN=x,OU=y,DC=emea,DC=corp,DC=local" -> "eu". */
+/** NetBIOS-style domain guess from a DN: "CN=x,OU=y,DC=emea,DC=corp,DC=local" -> "emea". */
 export function domainFromDn(dn: string): string | undefined {
   return /(?:^|,)DC=([^,]+)/i.exec(dn)?.[1]?.toLowerCase();
 }

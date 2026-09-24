@@ -50,7 +50,7 @@ describe("buildLogQuery", () => {
 
   it("requires a complete identity for session logs", () => {
     expect(() => buildLogQuery("traffic", { user: "jdoe" })).toThrow(/exactly as logged/);
-    expect(buildLogQuery("traffic", { user: "emea\\u123456" }).query).toBe("( user.src eq 'emea\\u123456' )");
+    expect(buildLogQuery("traffic", { user: "corp\\u123456" }).query).toBe("( user.src eq 'corp\\u123456' )");
   });
 
   it("only allows url_contains on url logs", () => {

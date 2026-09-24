@@ -41,7 +41,7 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
 - Log times are in Panorama's timezone, and forwarding can lag. Widen the window before concluding.
 - User names differ between sources and log searches need the exact identity:
   - GlobalProtect and Prisma Access users are logged by UPN (name@domain, external users often name-external@domain).
-  - Citrix and AD-mapped users are logged as DOMAIN\\id (for example emea\\u123456) behind shared Citrix IPs.
+  - Citrix and AD-mapped users are logged as DOMAIN\\id (for example corp\\u123456) behind shared Citrix IPs.
   - ad_lookup_user (when available) turns an email or display name into every log identity and lists the user's AD groups; diagnose_user_blocks uses it automatically.
   - Without AD, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
 - Group-based rules: ad_user_rules lists the rules targeting the user through their AD groups (nested included) and, with 'contains', the relevant rules reserved to other groups with the group the user lacks. The usual fix is then adding the user to the existing group (identity team), not a new rule.

@@ -14,7 +14,7 @@ describe("buildUserFilter", () => {
     );
   });
   it("uses the account part of DOMAIN\\id", () => {
-    expect(buildUserFilter("emea\\u123456")).toContain("(sAMAccountName=u123456)");
+    expect(buildUserFilter("corp\\u123456")).toContain("(sAMAccountName=u123456)");
   });
   it("matches display names in both orders", () => {
     const f = buildUserFilter("Jane DOE");

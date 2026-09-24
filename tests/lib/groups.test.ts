@@ -14,7 +14,7 @@ describe("principalKey", () => {
 
 describe("matchSourceUser", () => {
   const membership = {
-    identities: ["emea\\u123456", "jane.doe@corp.com"],
+    identities: ["corp\\u123456", "jane.doe@corp.com"],
     groups: ["CN=GRP-Upload-Allowed,OU=G,DC=emea,DC=corp", "APP-Marketing-Team"],
   };
 
@@ -24,7 +24,7 @@ describe("matchSourceUser", () => {
 
   it("matches the user identity whatever the case", () => {
     expect(matchSourceUser(["JANE.DOE@corp.com"], membership).matchedBy).toEqual(["JANE.DOE@corp.com"]);
-    expect(matchSourceUser(["EMEA\\U123456"], membership).matchedBy).toEqual(["EMEA\\U123456"]);
+    expect(matchSourceUser(["CORP\\U123456"], membership).matchedBy).toEqual(["CORP\\U123456"]);
   });
 
   it("matches groups across DN formats", () => {
