@@ -25,7 +25,7 @@ Rules:
 
 /** Method and answer format for a ticket; exposed as a tool because not every MCP client supports prompts. */
 export const TICKET_METHOD = `Ticket diagnosis method:
-1. List the facts from the ticket: user (and its exact logged identity if known), IP, requested site/URL, block page URL and category if a screenshot is described, action attempted (browse, upload, download, app), time, location (office, Citrix, GlobalProtect). Say which ones are missing.
+1. List the facts from the ticket: user (email or name; ad_lookup_user gives the logged identities and AD groups), IP, requested site/URL, block page URL and category if a screenshot is described, action attempted (browse, upload, download, app), time, location (office, Citrix, GlobalProtect). Say which ones are missing.
 2. Run diagnose_user_blocks with what you have: user and/or src_ip, reported_url, blocked_url, incident_time. If it returns need_identity, pick the identity or ask the human.
 3. Drill down on the blocking layer: diagnose_url_access (URL filtering), diagnose_threat_block (files, signatures), diagnose_flow (policy deny, App-ID, apps like GenAI). Use resolve_application and find_objects to check names. Read get_troubleshooting_playbook if the cause is unclear.
 4. Answer in the ticket's language with these sections: Summary / Evidence (quote logs and rules, say whose logs they are) / Root cause (confidence level) / Recommended fix (minimal; extend an existing exception rule or copy its pattern; only objects verified to exist; device group and position) / Risk / What to ask the user if data is missing.
@@ -41,7 +41,9 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
 - User names differ between sources and log searches need the exact identity:
   - GlobalProtect and Prisma Access users are logged by UPN (name@domain, external users often name-external@domain).
   - Citrix and AD-mapped users are logged as DOMAIN\\id (for example emea\\u123456) behind shared Citrix IPs.
-  - When only a display name is known, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
+  - ad_lookup_user (when available) turns an email or display name into every log identity and lists the user's AD groups; diagnose_user_blocks uses it automatically.
+  - Without AD, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
+- Group-based rules: compare the rule's source_user groups with the user's AD groups before concluding a rule should match.
 
 ## Third-party dependencies (ABC.com works but upload fails)
 - Web apps call other domains for uploads, storage, APIs, CDN, auth: S3, Azure Blob, GCS, CloudFront, Akamai, SharePoint, OneDrive, Box, Dropbox, and Okta/Entra ID for SSO.

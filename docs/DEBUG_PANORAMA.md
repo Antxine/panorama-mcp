@@ -74,7 +74,9 @@ PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la so
 - GlobalProtect et Prisma Access : UPN (`prenom.nom@domaine`, souvent `nom-external@domaine` pour les externes) ;
 - Citrix et AD : `DOMAINE\id` (par exemple `emea\u123456`), derrière des IP Citrix partagées.
 
-Si seul le nom est connu, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le site demandé (`reported_url`) : l'outil liste les identités vues pour cette URL.
+Sur un PC Windows du domaine, l'outil `ad_lookup_user` interroge l'Active Directory avec ta session. À partir d'un e-mail, d'un `DOMAINE\id` ou d'un « Prénom Nom », il renvoie le compte, les groupes AD et les identités telles qu'elles apparaissent dans les logs. `diagnose_user_blocks` s'en sert automatiquement : avec un e-mail, il cherche les logs sous l'UPN **et** sous `DOMAINE\id`.
+
+Sans AD, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le site demandé (`reported_url`) : l'outil liste les identités vues pour cette URL.
 
 ## Variables d'environnement
 
@@ -82,6 +84,7 @@ Si seul le nom est connu, donne à `diagnose_user_blocks` l'URL bloquée (`block
 |---|---|---|
 | `PANOS_READ_ONLY` | `true` | `false` réactive les outils d'écriture de Palo-MCP |
 | `PANOS_MODULES` | `panorama-debug` | `all` charge aussi les outils de Palo-MCP pensés pour les firewalls isolés |
+| `PANOS_AD_LOOKUP` | `auto` | Recherche AD : active sous Windows, `false` pour la désactiver, `true` pour la forcer |
 | `PANOS_LOG_TIMEOUT` | `120` | Délai maximal d'une requête de logs, en secondes ; au-delà, les résultats partiels sont renvoyés |
 
 ## Limites connues

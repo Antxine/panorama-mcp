@@ -7,7 +7,7 @@
  */
 
 // "panorama" (upstream raw config dumps) is left out: its outputs are huge and covered by debug/diagnose tools.
-export const PANORAMA_DEBUG_PRESET = ["firewalls", "utility", "debug", "urlcategories", "diagnose"];
+export const PANORAMA_DEBUG_PRESET = ["firewalls", "utility", "debug", "urlcategories", "diagnose", "directory"];
 
 export function isReadOnlyMode(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env.PANOS_READ_ONLY ?? "true").trim().toLowerCase();

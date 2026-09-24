@@ -25,6 +25,7 @@ import { registerUtilityTools } from "./tools/utility.js";
 import { registerDebugTools } from "./tools/debug.js";
 import { registerUrlCategoryTools } from "./tools/urlcategories.js";
 import { registerDiagnoseTools } from "./tools/diagnose.js";
+import { registerDirectoryTools } from "./tools/directory.js";
 import { SERVER_INSTRUCTIONS } from "./playbook.js";
 import { isReadOnlyMode, selectedModules } from "./config/mode.js";
 
@@ -82,6 +83,7 @@ const modules: Record<string, (s: McpServer) => void> = {
   debug: registerDebugTools,
   urlcategories: registerUrlCategoryTools,
   diagnose: registerDiagnoseTools,
+  directory: registerDirectoryTools,
 };
 
 const enabledModules = selectedModules(Object.keys(modules));

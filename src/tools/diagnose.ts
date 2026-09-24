@@ -4,6 +4,7 @@ import type { FirewallTarget } from "../api/client.js";
 import { jsonResponse, nodeText, resolveDevice } from "../api/panorama.js";
 import { describePick, originOf, pickDevice } from "../api/device.js";
 import { containersOf, fetchAppContainers, predefinedApp } from "../api/apps.js";
+import { adLookupEnabled, adLookupUser } from "../api/ad.js";
 import { ipUserMapping, logTime, panoramaTarget, searchLogs, testSecurityPolicyMatch, userGroups } from "../api/ops.js";
 import {
   appFamily,
@@ -122,7 +123,7 @@ export function registerDiagnoseTools(server: McpServer) {
     "diagnose_user_blocks",
     "[READ-ONLY] START HERE for a ticket. Builds a timeline of everything that blocked a user or source IP across traffic, threat, URL, WildFire, data filtering, decryption and GlobalProtect logs, grouped and explained (which layer blocked, why, what to check next). With reported_url, flags blocks on OTHER domains at the same time (upload/storage/CDN/SSO dependencies of the site). If the exact logged identity is unknown, pass blocked_url/reported_url (and the name as 'user'): it lists the identities seen for that URL.",
     {
-      user: userName.optional().describe("Exact logged identity (name@domain or DOMAIN\\id). A partial name is used only to pick among identities seen for the URL."),
+      user: userName.optional().describe("Email, DOMAIN\\id or name. Resolved through Active Directory when available (every log identity is searched), else from the identities seen for blocked_url/reported_url."),
       src_ip: ipAddress.optional(),
       reported_url: urlInput.optional().describe("Site the user was trying to use (from the ticket)"),
       blocked_url: urlInput.optional().describe("URL shown on the block page / screenshot, if any"),
@@ -137,8 +138,33 @@ export function registerDiagnoseTools(server: McpServer) {
       const { filters: time, incidentMs } = timeWindow(incident_time, period);
       const findings: string[] = [];
 
-      // Resolve the identity as logged when only a name (or nothing) is known.
-      if (!src_ip && !isFullIdentity(user)) {
+      // Identities under which the user may be logged: AD gives both DOMAIN\\id (Citrix/AD) and UPN (GlobalProtect).
+      let identities: string[] = [];
+      let adUser: Record<string, unknown> | undefined;
+      if (user && !src_ip && adLookupEnabled()) {
+        try {
+          const ad = await adLookupUser(user);
+          if (ad.users.length === 1) {
+            const u = ad.users[0];
+            identities = u.log_identities;
+            adUser = { displayName: u.displayName, department: u.department, company: u.company, disabled: u.disabled, groups: u.groups.slice(0, 40) };
+            findings.push(`AD: '${user}' is ${u.displayName} (${u.sam}); searching logs as ${identities.map((i) => `'${i}'`).join(", ")}.`);
+            if (u.disabled) findings.push("The AD account is DISABLED.");
+          } else if (ad.users.length > 1) {
+            return jsonResponse({
+              need_identity: true,
+              message: "Several AD users match: re-run with the right email or DOMAIN\\id.",
+              ad_candidates: ad.users.map((u) => ({ displayName: u.displayName, mail: u.mail, department: u.department, log_identities: u.log_identities })),
+            });
+          }
+        } catch (err) {
+          findings.push(`AD lookup unavailable: ${errMsg(err)}`);
+        }
+      }
+      if (!identities.length && isFullIdentity(user)) identities = [user!];
+
+      // Otherwise resolve the identity from who accessed the blocked/reported URL.
+      if (!src_ip && !identities.length) {
         const probe = blocked_url ?? reported_url;
         if (!probe) {
           throw new Error(
@@ -158,25 +184,27 @@ export function registerDiagnoseTools(server: McpServer) {
             identities_seen_for_url: seen.slice(0, 20),
           });
         }
-        user = candidates[0].user;
-        findings.push(`Identity resolved from URL logs: '${user}' (sources ${candidates[0].sources.join(", ")}).`);
+        identities = [candidates[0].user];
+        findings.push(`Identity resolved from URL logs: '${identities[0]}' (sources ${candidates[0].sources.join(", ")}).`);
       }
 
-      const who: LogFilters = { user: src_ip ? undefined : user, src_ip, ...time };
-      const searches: Parameters<typeof gatherLogs>[1] = [
-        { type: "traffic", filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "threat", filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "url", filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "data", filters: { ...who, only_blocked: true }, max: 50 },
-        { type: "wildfire", filters: who, max: 50, keep: (e) => !/benign/i.test(nodeText(e.category)) },
-        { type: "decryption", filters: who, max: 100, keep: (e) => Boolean(nodeText(e.error) || nodeText(e.error_index)) },
-      ];
-      if (user) searches.push({ type: "globalprotect", filters: { user, ...time }, max: 50, keep: (e) => /fail/i.test(nodeText(e.status)) });
+      // One search set per identity (or a single one by source IP).
+      const whos: LogFilters[] = src_ip ? [{ src_ip, ...time }] : identities.slice(0, 3).map((id) => ({ user: id, ...time }));
+      const searches: Parameters<typeof gatherLogs>[1] = whos.flatMap((who) => [
+        { type: "traffic" as const, filters: { ...who, only_blocked: true }, max: 200 },
+        { type: "threat" as const, filters: { ...who, only_blocked: true }, max: 200 },
+        { type: "url" as const, filters: { ...who, only_blocked: true }, max: 200 },
+        { type: "data" as const, filters: { ...who, only_blocked: true }, max: 50 },
+        { type: "wildfire" as const, filters: who, max: 50, keep: (e: Record<string, any>) => !/benign/i.test(nodeText(e.category)) },
+        { type: "decryption" as const, filters: who, max: 100, keep: (e: Record<string, any>) => Boolean(nodeText(e.error) || nodeText(e.error_index)) },
+      ]);
+      const upn = identities.find((i) => i.includes("@"));
+      if (upn) searches.push({ type: "globalprotect", filters: { user: upn, ...time }, max: 50, keep: (e) => /fail/i.test(nodeText(e.status)) });
 
       // Moments when the user reached the reported site (alert/block categories are logged).
       const reportedHost = reported_url ? hostOf(normalizeUrl(reported_url)) : undefined;
       const anchorSearch = reportedHost
-        ? gatherLogs(target, [{ type: "url", filters: { ...who, url_contains: baseDomain(reportedHost) }, max: 100 }])
+        ? gatherLogs(target, whos.map((who) => ({ type: "url" as const, filters: { ...who, url_contains: baseDomain(reportedHost) }, max: 100 })))
         : Promise.resolve({ events: [] as LogEvent[], counts: {}, errors: {} });
 
       const [{ events, counts, errors }, anchors] = await Promise.all([gatherLogs(target, searches), anchorSearch]);
@@ -206,7 +234,8 @@ export function registerDiagnoseTools(server: McpServer) {
       const devices = [...new Set(events.map((e) => nodeText(e.entry.device_name)).filter(Boolean))];
 
       return jsonResponse({
-        searched: { user, src_ip, ...time, matches_per_log_type: counts },
+        searched: { identities: src_ip ? undefined : identities, src_ip, ...time, matches_per_log_type: counts },
+        ...(adUser ? { ad_user: adUser } : {}),
         devices_seen: devices,
         findings,
         groups: groups.slice(0, max_groups ?? 25),

@@ -11,7 +11,7 @@ describe("isReadOnlyMode", () => {
 });
 
 describe("selectedModules", () => {
-  const all = ["firewalls", "panorama", "utility", "debug", "urlcategories", "diagnose", "nat"];
+  const all = ["firewalls", "panorama", "utility", "debug", "urlcategories", "diagnose", "directory", "nat"];
   it("defaults to the panorama-debug preset", () => {
     expect(selectedModules(all, {})).toEqual(PANORAMA_DEBUG_PRESET);
   });
