@@ -15,7 +15,7 @@ Ce fork de [Palo-MCP](https://github.com/apius-tech/Palo-MCP) aide à diagnostiq
 
 ## Installation
 
-Prérequis : Node.js 22.19 ou plus, et un compte admin Panorama dédié au MCP avec un rôle en lecture seule, qui a accès à l'API XML (config, op, log).
+Prérequis : Node.js 22.19 ou plus, et un compte admin Panorama dédié au MCP avec un rôle en lecture seule. Dans ce rôle, l'API XML doit autoriser **Configuration**, **Operational Requests** et **Log**. Sans Operational Requests, les outils en direct (User-ID, `test`, sessions) répondent « Type [op] not authorized » ; les outils de config et de logs fonctionnent quand même.
 
 ```bash
 npm install && npm run build
@@ -68,6 +68,22 @@ Le modèle suit cette méthode :
    - `diagnose_flow` : mapping User-ID et groupes, règle réellement matchée par le firewall (`test security-policy-match`), règles qui autorisent l'application (y compris les fonctions `*-uploading`).
 4. **Conclusion** : preuves, cause racine, niveau de confiance, correctif minimal qui réutilise l'existant, et informations à demander à l'utilisateur si des données manquent.
 
+## Identités utilisateur
+
+PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la source :
+- GlobalProtect et Prisma Access : UPN (`prenom.nom@domaine`, souvent `nom-external@domaine` pour les externes) ;
+- Citrix et AD : `DOMAINE\id` (par exemple `emea\u123456`), derrière des IP Citrix partagées.
+
+Si seul le nom est connu, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le site demandé (`reported_url`) : l'outil liste les identités vues pour cette URL.
+
+## Variables d'environnement
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `PANOS_READ_ONLY` | `true` | `false` réactive les outils d'écriture de Palo-MCP |
+| `PANOS_MODULES` | `panorama-debug` | `all` charge aussi les outils de Palo-MCP pensés pour les firewalls isolés |
+| `PANOS_LOG_TIMEOUT` | `120` | Délai maximal d'une requête de logs, en secondes ; au-delà, les résultats partiels sont renvoyés |
+
 ## Limites connues
 
 - La config lue est la **running config de Panorama**. Les règles locales des firewalls et les changements non poussés n'y apparaissent pas. `test_security_policy_match` interroge le firewall et reste la référence.
@@ -75,6 +91,9 @@ Le modèle suit cette méthode :
 - PAN-OS ne loggue pas les catégories URL en action `allow`. Pour les dépendances d'un site, un export DevTools/HAR peut rester nécessaire.
 - Les logs globalprotect, userid et auth sont filtrés localement (sur 2000 entrées au plus), car leurs champs de filtre diffèrent des logs traffic et threat.
 - Les heures de logs sont dans le fuseau horaire de Panorama.
+- Les recherches sur 30 jours dépassent souvent le délai : préfère `incident_time` (±30 min) ou `last-24-hrs`.
+- Prisma Access (« GP cloud service », « RN-… ») : pas de commandes en direct, uniquement les logs et la config des device groups Prisma.
+- Les réponses sont plafonnées à environ 40 Ko (listes tronquées, avec mention) pour éviter que le client ne les écrive dans des fichiers.
 
 ## À valider sur notre Panorama
 

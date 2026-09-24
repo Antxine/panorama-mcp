@@ -16,6 +16,14 @@ export interface ApiResponse {
   success: boolean;
   data?: any;
   error?: string;
+  /** Log queries only: the job did not finish in time and data holds the logs received so far. */
+  partial?: boolean;
+}
+
+/** Log query timeout in seconds (PANOS_LOG_TIMEOUT, default 120): large Panorama log searches are slow. */
+function logTimeoutSeconds(): number {
+  const value = Number(process.env.PANOS_LOG_TIMEOUT);
+  return Number.isFinite(value) && value > 0 ? value : 120;
 }
 
 export interface FirewallTarget {
@@ -181,8 +189,9 @@ export async function executeLogQuery(
 
   // Step 2: Poll for results (type=log&action=get)
   const pollUrl = `https://${target.host}/api/?type=log&action=get&job-id=${jobId}`;
-  const maxAttempts = 30;
+  const maxAttempts = logTimeoutSeconds();
   const pollIntervalMs = 1000;
+  let lastLogs: any;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -203,9 +212,17 @@ export async function executeLogQuery(
     if (status === "FIN" || pollResult.data?.log?.logs?.["@_progress"] === "100") {
       return { success: true, data: pollResult.data?.log?.logs };
     }
+    lastLogs = pollResult.data?.log?.logs ?? lastLogs;
   }
 
-  return { success: false, error: `Log query timed out after ${maxAttempts} seconds (job ${jobId})` };
+  // Stop the job on Panorama so abandoned queries do not keep loading the log collectors.
+  makeRequest(`https://${target.host}/api/?type=log&action=finish&job-id=${jobId}`, target.apiKey, target.verifySSL).catch(() => undefined);
+
+  if (lastLogs?.entry) return { success: true, data: lastLogs, partial: true };
+  return {
+    success: false,
+    error: `Log query timed out after ${maxAttempts} seconds (job ${jobId}). Narrow the time window (incident_time or a shorter period) or add filters (src_ip, user).`,
+  };
 }
 
 export async function getConfig(xpath: string, target?: FirewallTarget): Promise<ApiResponse> {
@@ -352,7 +369,13 @@ export function formatResponse(result: ApiResponse): { content: Array<{ type: "t
     };
   }
 
+  // Raw config dumps can reach hundreds of KB, which MCP clients spill to files.
+  const MAX_CHARS = 40_000;
+  let text = JSON.stringify(result.data, null, 2);
+  if (text.length > MAX_CHARS) {
+    text = `${text.slice(0, MAX_CHARS)}\n... [TRUNCATED: ${text.length} chars total. Use a narrower XPath or the debug/diagnose tools.]`;
+  }
   return {
-    content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }],
+    content: [{ type: "text", text }],
   };
 }

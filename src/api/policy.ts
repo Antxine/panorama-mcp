@@ -223,6 +223,18 @@ export async function fetchDgAncestors(target: FirewallTarget): Promise<Map<stri
   return ancestors;
 }
 
+/** Device group names from the read-only config (no op permission needed), falling back to `show devicegroups`. */
+export async function listDeviceGroupNames(target: FirewallTarget): Promise<string[]> {
+  const names = [...(await fetchDgAncestors(target)).keys()];
+  if (names.length) return names;
+  return (await listDeviceGroups(target)).map((g) => g.name);
+}
+
+/** Every config location: shared plus all device groups. */
+export async function allLocations(target: FirewallTarget): Promise<string[]> {
+  return ["shared", ...(await listDeviceGroupNames(target))];
+}
+
 export interface DeviceScope {
   deviceGroup?: string;
   /** Locations whose policies apply to the device, in evaluation order of pre-rules. */
@@ -236,7 +248,7 @@ export interface DeviceScope {
 export async function scopeForDevice(target: FirewallTarget, serial: string): Promise<DeviceScope> {
   const groups = await listDeviceGroups(target);
   const group = groups.find((g) => g.devices.some((d) => d.serial === serial));
-  if (!group) return { locations: ["shared", ...groups.map((g) => g.name)] };
+  if (!group) return { locations: await allLocations(target) };
   return scopeForDeviceGroup(target, group.name);
 }
 
@@ -272,6 +284,9 @@ export function sortByEvaluationOrder(rules: RuleSummary[], locations: string[])
   });
 }
 
+/** Long member lists (hundreds of apps on some rules) are cut in summaries. */
+const MAX_LIST = 15;
+
 /** Short one-line-ish view of a rule for tool output. */
 export function compactRule(r: RuleSummary): Record<string, unknown> {
   const out: Record<string, unknown> = {
@@ -291,7 +306,10 @@ export function compactRule(r: RuleSummary): Record<string, unknown> {
     ["category", r.category],
   ];
   for (const [key, values, negate] of lists) {
-    if (values.length && !(values.length === 1 && values[0] === "any")) out[key] = negate ? { not: values } : values;
+    if (values.length && !(values.length === 1 && values[0] === "any")) {
+      const shown = values.length > MAX_LIST ? [...values.slice(0, MAX_LIST), `... +${values.length - MAX_LIST} more`] : values;
+      out[key] = negate ? { not: shown } : shown;
+    }
   }
   if (r.targetDevices.length) out.target_devices = r.targetNegate ? { not: r.targetDevices } : r.targetDevices;
   if (r.profileGroup) out.profile_group = r.profileGroup;
@@ -416,4 +434,60 @@ export async function fetchFileBlockingProfiles(target: FirewallTarget, location
     )
   );
   return perLocation.flat();
+}
+
+/** Application "family": 'adobe-podcast' -> 'adobe', to find exceptions for sibling App-IDs. */
+export function appFamily(app: string): string {
+  return app.split("-")[0].toLowerCase();
+}
+
+/**
+ * Existing per-user/group allow rules for the same categories or application family, preferably in
+ * the blocking rule's device group and placed before it: the organization's exception pattern
+ * (profile group, schedule, naming) to extend or copy instead of inventing a new one.
+ */
+export function findExceptionRules(
+  rules: RuleSummary[],
+  match: { categories?: string[]; apps?: string[] },
+  blocking?: RuleSummary,
+  limit = 5
+): RuleSummary[] {
+  const cats = new Set(match.categories ?? []);
+  const families = new Set((match.apps ?? []).map(appFamily));
+  const apps = new Set(match.apps ?? []);
+  const candidates = rules.filter(
+    (r) =>
+      r.policy === "security" &&
+      r.action === "allow" &&
+      !r.disabled &&
+      r.sourceUser.length > 0 &&
+      !r.sourceUser.includes("any") &&
+      (r.category.some((c) => cats.has(c)) || r.application.some((a) => apps.has(a) || families.has(appFamily(a))))
+  );
+  const rank = (r: RuleSummary) => {
+    if (!blocking) return 1;
+    const sameSpot = r.location === blocking.location && r.rulebase === blocking.rulebase;
+    if (sameSpot && r.position < blocking.position) return 0;
+    return sameSpot ? 2 : 1;
+  };
+  return candidates.sort((a, b) => rank(a) - rank(b) || a.position - b.position).slice(0, limit);
+}
+
+/** One-line description of the exception pattern shared by existing rules. */
+export function exceptionPattern(rules: RuleSummary[]): string | undefined {
+  if (!rules.length) return undefined;
+  const count = (values: Array<string | undefined>) => {
+    const tally = new Map<string, number>();
+    for (const v of values) if (v) tally.set(v, (tally.get(v) ?? 0) + 1);
+    return [...tally.entries()].sort((a, b) => b[1] - a[1]).map(([v]) => v);
+  };
+  const groups = count(rules.map((r) => r.profileGroup));
+  const schedules = rules.filter((r) => r.schedule).length;
+  const where = count(rules.map((r) => `${r.location}/${r.rulebase}`));
+  return (
+    `Existing exception rules (${rules.map((r) => `'${r.name}'`).join(", ")}) live in ${where[0]}` +
+    (groups.length ? `, use profile group '${groups[0]}'` : "") +
+    (schedules ? `, ${schedules}/${rules.length} have an expiry schedule` : "") +
+    ". Prefer adding the user to a matching one, or copy this pattern exactly (same profile group, schedule, naming, ticket in description); do not invent object names."
+  );
 }

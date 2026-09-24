@@ -122,17 +122,26 @@ export async function listDeviceGroups(target: FirewallTarget, refresh = false):
   return groups;
 }
 
-/** Device group names to search: the requested one, or "shared" plus every device group. */
-export async function locationsToSearch(target: FirewallTarget, deviceGroup?: string): Promise<string[]> {
-  if (deviceGroup) return [deviceGroup];
-  const groups = await listDeviceGroups(target);
-  return ["shared", ...groups.map((g) => g.name)];
+/** Config reads fan out over every device group: cap concurrency to spare Panorama's management plane. */
+const MAX_CONCURRENT_READS = 8;
+let activeReads = 0;
+const waiting: Array<() => void> = [];
+
+async function withReadSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeReads >= MAX_CONCURRENT_READS) await new Promise<void>((resolve) => waiting.push(resolve));
+  activeReads++;
+  try {
+    return await fn();
+  } finally {
+    activeReads--;
+    waiting.shift()?.();
+  }
 }
 
 /** Reads `<location>/<relative>` from the running config and returns its `entry` list. */
 export async function readEntries(target: FirewallTarget, deviceGroup: string, relative: string): Promise<any[]> {
   const xpath = `${locationXpath(deviceGroup)}/${relative}`;
-  const result = await showConfig(xpath, target);
+  const result = await withReadSlot(() => showConfig(xpath, target));
   if (!result.success) {
     // An empty or missing node is reported as an error by some PAN-OS versions.
     if (/No such node|not present/i.test(result.error ?? "")) return [];
@@ -143,9 +152,45 @@ export async function readEntries(target: FirewallTarget, deviceGroup: string, r
   return asArray(node?.entry);
 }
 
-/** Compact JSON tool response; keeps token usage low compared to indented output. */
+/** Above this size, MCP clients spill the output to a file and the model starts parsing it with shell scripts. */
+const MAX_RESPONSE_CHARS = 40_000;
+
+/**
+ * Compact JSON tool response. Oversized payloads are shrunk by cutting the longest arrays
+ * (with an explicit marker) rather than returning something the client cannot show.
+ */
 export function jsonResponse(data: unknown): { content: Array<{ type: "text"; text: string }> } {
-  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+  let text = JSON.stringify(data);
+  if (text.length > MAX_RESPONSE_CHARS) {
+    const shrunk = shrinkArrays(data, MAX_RESPONSE_CHARS);
+    text = JSON.stringify(shrunk);
+    if (text.length > MAX_RESPONSE_CHARS) text = `${text.slice(0, MAX_RESPONSE_CHARS)}... [TRUNCATED]`;
+    text += "\n[Output reduced to stay readable: narrow the filters (time window, src_ip, device_group, max_results) for full details.]";
+  }
+  return { content: [{ type: "text", text }] };
+}
+
+/** Halves the longest arrays until the JSON fits, marking each cut. */
+function shrinkArrays(data: unknown, limit: number): unknown {
+  let copy = JSON.parse(JSON.stringify(data));
+  for (let round = 0; round < 12 && JSON.stringify(copy).length > limit; round++) {
+    let longest: { holder: any; key: string | number; length: number } | undefined;
+    const visit = (node: any) => {
+      if (!node || typeof node !== "object") return;
+      for (const [key, value] of Object.entries(node)) {
+        if (Array.isArray(value) && value.length > 3 && (!longest || value.length > longest.length)) {
+          longest = { holder: node, key, length: value.length };
+        }
+        visit(value);
+      }
+    };
+    visit(copy);
+    if (!longest) break;
+    const arr = longest.holder[longest.key] as unknown[];
+    const keep = Math.max(3, Math.floor(arr.length / 2));
+    longest.holder[longest.key] = [...arr.slice(0, keep), `... ${arr.length - keep} more omitted`];
+  }
+  return copy;
 }
 
 export function errorResponse(error: unknown): { content: Array<{ type: "text"; text: string }> } {

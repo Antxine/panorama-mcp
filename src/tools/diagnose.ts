@@ -2,11 +2,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { FirewallTarget } from "../api/client.js";
 import { jsonResponse, nodeText, resolveDevice } from "../api/panorama.js";
-import { describePick, pickDevice } from "../api/device.js";
+import { describePick, originOf, pickDevice } from "../api/device.js";
+import { containersOf, fetchAppContainers, predefinedApp } from "../api/apps.js";
 import { ipUserMapping, logTime, panoramaTarget, searchLogs, testSecurityPolicyMatch, userGroups } from "../api/ops.js";
 import {
+  appFamily,
   compactRule,
   effectiveProfiles,
+  exceptionPattern,
+  findExceptionRules,
   fetchFileBlockingProfiles,
   fetchProfileGroups,
   fetchRules,
@@ -16,9 +20,10 @@ import {
   sortByEvaluationOrder,
 } from "../api/policy.js";
 import { analyzeUrl, categoryUsage, resolveScope, summarizeUsage, urlFindings } from "../api/urlanalysis.js";
-import { classifyLogEntry } from "../lib/classify.js";
+import { classifyLogEntry, isBlockingAction } from "../lib/classify.js";
+import { summarizeLogs } from "../lib/summarize.js";
 import { groupEvents, NO_LOG_HINTS, reportedSiteFindings, type LogEvent } from "../lib/correlate.js";
-import { trimLogEntry, type LogFilters, type LogPeriod, type LogType } from "../lib/logquery.js";
+import { assertFullIdentity, trimLogEntry, type LogFilters, type LogPeriod, type LogType } from "../lib/logquery.js";
 import { baseDomain, hostOf, normalizeUrl } from "../lib/urlmatch.js";
 import { firewallName } from "../schemas/panos.js";
 import { deviceGroupFilter, ipAddress, logPeriod, managedDevice, port, urlInput, userName } from "../schemas/debug.js";
@@ -47,6 +52,26 @@ function timeWindow(incident?: string, period?: LogPeriod): { filters: Pick<LogF
     }
   }
   return { filters: { period: period ?? "last-24-hrs" } };
+}
+
+function isFullIdentity(user?: string): boolean {
+  return Boolean(user && /[@\\]/.test(user));
+}
+
+/** Identities (and their source IPs) seen in URL logs for a URL: resolves "Jane Doe" into the logged identity. */
+async function identitiesForUrl(target: FirewallTarget, url: string, time: Pick<LogFilters, "period" | "start_time" | "end_time">) {
+  const res = await searchLogs(target, "url", { url_contains: hostOf(normalizeUrl(url)), ...time }, 500);
+  const seen = new Map<string, { user: string; count: number; sources: string[] }>();
+  for (const e of res.entries) {
+    const u = nodeText(e.srcuser);
+    if (!u) continue;
+    const item = seen.get(u) ?? { user: u, count: 0, sources: [] };
+    item.count++;
+    const src = nodeText(e.src);
+    if (src && !item.sources.includes(src) && item.sources.length < 3) item.sources.push(src);
+    seen.set(u, item);
+  }
+  return [...seen.values()].sort((a, b) => b.count - a.count);
 }
 
 function errMsg(err: unknown): string {
@@ -95,23 +120,49 @@ const SUBTYPE_PROFILE: Record<string, string> = {
 export function registerDiagnoseTools(server: McpServer) {
   server.tool(
     "diagnose_user_blocks",
-    "[READ-ONLY] START HERE for a ticket. Builds a timeline of everything that blocked a user or source IP across traffic, threat, URL, WildFire, data filtering, decryption and GlobalProtect logs, grouped and explained (which layer blocked, why, what to check next). With reported_url, flags blocks on OTHER domains at the same time (upload/storage/CDN/SSO dependencies of the site).",
+    "[READ-ONLY] START HERE for a ticket. Builds a timeline of everything that blocked a user or source IP across traffic, threat, URL, WildFire, data filtering, decryption and GlobalProtect logs, grouped and explained (which layer blocked, why, what to check next). With reported_url, flags blocks on OTHER domains at the same time (upload/storage/CDN/SSO dependencies of the site). If the exact logged identity is unknown, pass blocked_url/reported_url (and the name as 'user'): it lists the identities seen for that URL.",
     {
-      user: userName.optional(),
+      user: userName.optional().describe("Exact logged identity (name@domain or DOMAIN\\id). A partial name is used only to pick among identities seen for the URL."),
       src_ip: ipAddress.optional(),
-      reported_url: urlInput.optional().describe("Site mentioned in the ticket"),
+      reported_url: urlInput.optional().describe("Site the user was trying to use (from the ticket)"),
+      blocked_url: urlInput.optional().describe("URL shown on the block page / screenshot, if any"),
       incident_time: incidentTime,
       period: logPeriod,
-      max_groups: z.number().int().min(1).max(100).optional().describe("Default 30"),
+      max_groups: z.number().int().min(1).max(100).optional().describe("Default 25"),
       firewall: panoramaEntry,
     },
     { title: "Diagnose User Blocks", ...READ_ONLY },
-    async ({ user, src_ip, reported_url, incident_time, period, max_groups, firewall }) => {
-      if (!user && !src_ip) throw new Error("Provide 'user' and/or 'src_ip'");
+    async ({ user, src_ip, reported_url, blocked_url, incident_time, period, max_groups, firewall }) => {
       const target = panoramaTarget(firewall);
       const { filters: time, incidentMs } = timeWindow(incident_time, period);
-      const who: LogFilters = { user, src_ip, ...time };
+      const findings: string[] = [];
 
+      // Resolve the identity as logged when only a name (or nothing) is known.
+      if (!src_ip && !isFullIdentity(user)) {
+        const probe = blocked_url ?? reported_url;
+        if (!probe) {
+          throw new Error(
+            "Provide src_ip, the exact logged identity (name@domain or DOMAIN\\id), or blocked_url/reported_url to discover who accessed it."
+          );
+        }
+        const seen = await identitiesForUrl(target, probe, time);
+        const hint = user?.toLowerCase();
+        const candidates = hint ? seen.filter((i) => i.user.toLowerCase().includes(hint)) : seen;
+        if (candidates.length !== 1) {
+          return jsonResponse({
+            need_identity: true,
+            message:
+              candidates.length === 0
+                ? `No identity matching '${user ?? ""}' accessed ${hostOf(normalizeUrl(probe))} in this window. Citrix users appear as DOMAIN\\id: ask for the user's ID, or use the source IP.`
+                : "Several identities accessed this URL: re-run with the right one as 'user' (or its src_ip).",
+            identities_seen_for_url: seen.slice(0, 20),
+          });
+        }
+        user = candidates[0].user;
+        findings.push(`Identity resolved from URL logs: '${user}' (sources ${candidates[0].sources.join(", ")}).`);
+      }
+
+      const who: LogFilters = { user: src_ip ? undefined : user, src_ip, ...time };
       const searches: Parameters<typeof gatherLogs>[1] = [
         { type: "traffic", filters: { ...who, only_blocked: true }, max: 200 },
         { type: "threat", filters: { ...who, only_blocked: true }, max: 200 },
@@ -137,7 +188,19 @@ export function registerDiagnoseTools(server: McpServer) {
         anchors.events
       ).filter((g) => g.blocked || g.layer !== "none");
 
-      const findings = reportedSiteFindings(groups, reported_url);
+      findings.push(...reportedSiteFindings(groups, reported_url));
+      if (blocked_url) {
+        const blockedHost = hostOf(normalizeUrl(blocked_url));
+        const hit = groups.find((g) => g.destination === blockedHost);
+        findings.push(
+          hit
+            ? `The block page URL ${blockedHost} is confirmed in the logs: ${hit.summary}.`
+            : `The block page URL ${blockedHost} was not found in the blocked logs of this window: check the time window and identity.`
+        );
+        if (reportedHost && baseDomain(blockedHost) !== baseDomain(reportedHost)) {
+          findings.push(`The blocked resource (${blockedHost}) is NOT the requested site (${reportedHost}): the fix must target ${blockedHost}.`);
+        }
+      }
       const layers = [...new Set(groups.filter((g) => g.blocked).map((g) => g.layer))];
       if (layers.length) findings.push(`Blocking layers found: ${layers.join(", ")}. Drill down with the next_steps of each group.`);
       const devices = [...new Set(events.map((e) => nodeText(e.entry.device_name)).filter(Boolean))];
@@ -146,7 +209,7 @@ export function registerDiagnoseTools(server: McpServer) {
         searched: { user, src_ip, ...time, matches_per_log_type: counts },
         devices_seen: devices,
         findings,
-        groups: groups.slice(0, max_groups ?? 30),
+        groups: groups.slice(0, max_groups ?? 25),
         ...(Object.keys(errors).length ? { errors } : {}),
         ...(groups.length ? {} : { no_result_hints: NO_LOG_HINTS }),
       });
@@ -155,44 +218,77 @@ export function registerDiagnoseTools(server: McpServer) {
 
   server.tool(
     "diagnose_url_access",
-    "[READ-ONLY] Full analysis of why a URL is blocked/allowed: existing custom categories covering it (or same-domain entries that do not match), PAN-DB category, rules and URL filtering profiles using those categories, recent URL logs for the user, and conclusions. Prevents proposing a category that already exists.",
+    "[READ-ONLY] Full analysis of why a URL is blocked/allowed: existing custom categories covering it (from config AND from the categories the firewall logged), same-domain entries that do not match, PAN-DB category, rules and URL filtering profiles using those categories, the organization's existing exception rules to extend or copy, recent URL logs, and conclusions. Prevents proposing a category, profile or rule that already exists.",
     {
       url: urlInput,
-      user: userName.optional(),
+      user: userName.optional().describe("Exact logged identity (name@domain or DOMAIN\\id); other values are ignored for log filtering"),
       src_ip: ipAddress.optional(),
-      device_group: deviceGroupFilter.describe("Device group of the user's site. Inferred from the user's logs when omitted."),
+      device_group: deviceGroupFilter.describe("Device group of the user's site. Inferred from the logs when omitted."),
       device: managedDevice.optional().describe("Specific firewall; usually omit it."),
+      incident_time: incidentTime,
       period: logPeriod,
       firewall: panoramaEntry,
     },
     { title: "Diagnose URL Access", ...READ_ONLY },
-    async ({ url, device, device_group, user, src_ip, period, firewall }) => {
+    async ({ url, device, device_group, user, src_ip, incident_time, period, firewall }) => {
       const target = panoramaTarget(firewall);
       const host = hostOf(normalizeUrl(url));
+      const { filters: time } = timeWindow(incident_time, period);
+      const findings: string[] = [];
+      const logUser = isFullIdentity(user) ? user : undefined;
+      if (user && !logUser) findings.push(`'${user}' is not a complete logged identity: URL logs were searched for all users (see users in recent_url_logs).`);
 
-      const logs = await searchLogs(target, "url", { user, src_ip, url_contains: host, period: period ?? "last-24-hrs" }, 20).catch(
-        (err) => ({ query: "", entries: [] as Record<string, any>[], matched: 0, error: errMsg(err) })
-      );
-      if (!device && !device_group && logs.entries[0]?.serial) device = nodeText(logs.entries[0].serial);
+      const logs = await searchLogs(target, "url", { user: src_ip ? undefined : logUser, src_ip, url_contains: host, ...time }, 200).catch((err) => ({
+        query: "",
+        entries: [] as Record<string, any>[],
+        matched: 0,
+        error: errMsg(err),
+      }));
+      const blockedLogs = logs.entries.filter((e) => isBlockingAction("url", nodeText(e.action)));
+      const latest = blockedLogs[0] ?? logs.entries[0];
 
-      const scope = await resolveScope(target, device, device_group, { src_ip, user, anyConnected: true });
+      const scope = await resolveScope(target, device, device_group, { origin: originOf(latest), src_ip, user: logUser, anyConnected: true });
+      if (scope.note) findings.push(scope.note);
       const analysis = await analyzeUrl(target, url, scope);
-      const usage = await categoryUsage(target, analysis.effectiveCategories, scope);
-      const findings = urlFindings(analysis, usage, scope);
 
-      const latest = logs.entries[0];
+      // Categories the firewall actually assigned (custom ones included) complement the config analysis.
+      const loggedCategories = [...new Set(logs.entries.flatMap((e) => (nodeText(e.url_category_list) || nodeText(e.category)).split(",")).map((c) => c.trim()).filter(Boolean))];
+      const categories = [...new Set([...analysis.effectiveCategories, ...loggedCategories])];
+      const usage = await categoryUsage(target, categories, scope);
+      findings.push(...urlFindings(analysis, usage, scope));
+
+      const loggedCustom = loggedCategories.filter((c) => /[A-Z ]/.test(c) && !analysis.covering.some((x) => x.category === c));
+      if (loggedCustom.length) {
+        findings.push(
+          `The firewall logged custom categor${loggedCustom.length > 1 ? "ies" : "y"} ${loggedCustom.map((c) => `'${c}'`).join(", ")} for this URL: ` +
+            "they ALREADY exist (check usage below) - do not propose creating one."
+        );
+      }
+
       if (latest) {
         const logged = nodeText(latest.url_category_list) || nodeText(latest.category);
-        findings.push(`Latest URL log (${nodeText(latest.receive_time)}): action ${nodeText(latest.action)}, categories '${logged}', rule '${nodeText(latest.rule)}'.`);
+        findings.push(`Latest ${blockedLogs.length ? "blocked " : ""}URL log (${nodeText(latest.receive_time)}): action ${nodeText(latest.action)}, categories '${logged}', rule '${nodeText(latest.rule)}', user '${nodeText(latest.srcuser)}'.`);
         for (const c of analysis.covering) {
           if (!logged.split(",").includes(c.category)) {
-            findings.push(
-              `The firewall did NOT classify the URL in '${c.category}' at that time: entry pattern not matching the real hostname, config not pushed, or log older than the change.`
-            );
+            findings.push(`The firewall did NOT classify the URL in '${c.category}' at that time: entry pattern not matching the real hostname, config not pushed, or log older than the change.`);
           }
         }
       } else {
-        findings.push(`No URL log for ${host}${user || src_ip ? " for this user" : ""}: the category may be set to 'allow' (not logged), or the block happens elsewhere (another domain, file blocking, policy).`);
+        findings.push(`No URL log for ${host}: the category may be set to 'allow' (not logged), or the block happens elsewhere (another domain, file blocking, policy).`);
+      }
+
+      // Existing exception rules to reuse or copy, around the rule that enforced the block.
+      const blockingRule = latest
+        ? sortByEvaluationOrder(usage.allRules.filter((r) => r.policy === "security" && r.name === nodeText(latest.rule)), scope.locations)[0]
+        : undefined;
+      const customCats = categories.filter((c) => /[A-Z ]/.test(c));
+      const exceptions = findExceptionRules(usage.allRules, { categories: customCats }, blockingRule);
+      const pattern = exceptionPattern(exceptions);
+      if (pattern) findings.push(pattern);
+      if (blockingRule) {
+        findings.push(
+          `The enforcing rule '${blockingRule.name}' is in ${blockingRule.location}/${blockingRule.rulebase} #${blockingRule.position}: an exception rule must be placed before it, in the same device group (or a parent evaluated earlier).`
+        );
       }
       findings.push("If this URL is allowed but the site still fails, run diagnose_user_blocks with reported_url: the site may depend on other domains.");
 
@@ -202,9 +298,12 @@ export function registerDiagnoseTools(server: McpServer) {
         scope: scope.locations,
         findings,
         custom_categories: { covered_by: analysis.covering, category_match: analysis.categoryMatch, same_domain_not_matching: analysis.related },
+        logged_categories: loggedCategories,
         pan_db: analysis.panDb ?? analysis.panDbError,
         usage: summarizeUsage(usage),
-        recent_url_logs: logs.entries.map((e) => trimLogEntry("url", e)),
+        blocking_rule: blockingRule ? compactRule(blockingRule) : undefined,
+        existing_exception_rules: exceptions.map(compactRule),
+        recent_url_logs: summarizeLogs("url", logs.entries, 10),
       });
     }
   );
@@ -354,16 +453,16 @@ export function registerDiagnoseTools(server: McpServer) {
 
   server.tool(
     "diagnose_flow",
-    "[READ-ONLY] Analyzes a flow (source -> destination:port) on a firewall: User-ID mapping and groups of the source, rule the firewall actually matches (test security-policy-match with the user), rules allowing the requested application, and recent traffic logs explained. Use for 'no rule allows X', upload app functions, App-ID or network issues.",
+    "[READ-ONLY] Analyzes a flow (source -> destination:port) and/or an application: User-ID mapping and groups of the source, rule the firewall actually matches (test security-policy-match), which application groups/filters contain the App-ID and which rules allow or deny them, the organization's existing exception rules for that app family, and recent traffic logs explained. Use for 'no rule allows X', upload app functions, App-ID or network issues. Works for Prisma Access users with config and logs only.",
     {
-      device: managedDevice.optional().describe("Specific firewall; usually omit it (inferred from the source's traffic or device_group)."),
-      device_group: deviceGroupFilter,
       destination: ipAddress.describe("Destination IP (pre-NAT)"),
       destination_port: port,
       protocol: z.number().int().min(0).max(255).optional().describe("Default 6 (TCP)"),
       src_ip: ipAddress.optional(),
-      user: userName.optional(),
-      application: z.string().max(63).optional().describe("App-ID, e.g. 'box-uploading'. Partial names also search related functions (e.g. 'box')"),
+      user: userName.optional().describe("Exact logged identity (name@domain or DOMAIN\\id)"),
+      application: z.string().max(63).optional().describe("App-ID seen in logs, e.g. 'adobe-podcast' or 'box-uploading'"),
+      device_group: deviceGroupFilter,
+      device: managedDevice.optional().describe("Specific firewall; usually omit it (inferred from the source's traffic or device_group)."),
       period: logPeriod,
       firewall: panoramaEntry,
     },
@@ -376,59 +475,92 @@ export function registerDiagnoseTools(server: McpServer) {
       const time = { period: period ?? ("last-24-hrs" as LogPeriod) };
 
       if (!src_ip && user) {
-        const recent = await searchLogs(target, "traffic", { user, ...time }, 200).catch(() => undefined);
+        const recent = await searchLogs(target, "traffic", { user: assertFullIdentity(user), ...time }, 200);
         const counts = new Map<string, number>();
-        for (const e of recent?.entries ?? []) counts.set(nodeText(e.src), (counts.get(nodeText(e.src)) ?? 0) + 1);
+        for (const e of recent.entries) counts.set(nodeText(e.src), (counts.get(nodeText(e.src)) ?? 0) + 1);
         src_ip = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
         if (!src_ip) throw new Error(`No traffic log for user '${user}' in ${time.period}: provide src_ip`);
         findings.push(`Source IP inferred from traffic logs: ${src_ip}${counts.size > 1 ? ` (other IPs seen: ${[...counts.keys()].filter((k) => k !== src_ip).join(", ")})` : ""}.`);
       }
 
-      const pick = await pickDevice(target, { device, device_group, src_ip, user });
-      const dev = pick.device;
-      out.firewall_used = describePick(pick);
+      // Live checks need a managed firewall; Prisma Access traffic only has logs and config.
+      const pick = await pickDevice(target, { device, device_group, src_ip, user }).catch((err) => err as Error);
+      let locations: string[];
+      let serial: string | undefined;
+      if (pick instanceof Error) {
+        out.live_checks = pick.message;
+        const scope = await resolveScope(target, undefined, device_group, { src_ip });
+        locations = scope.locations;
+        if (scope.note) findings.push(scope.note);
+      } else {
+        const dev = pick.device;
+        serial = dev.serial;
+        out.firewall_used = describePick(pick);
+        locations = (await scopeForDevice(target, dev.serial)).locations;
 
-      const mapping = await ipUserMapping(target, dev.serial, src_ip!).catch((err) => errMsg(err));
-      out.user_id_mapping = mapping;
-      const mappedUser = Array.isArray(mapping) ? mapping[0]?.user : undefined;
-      if (Array.isArray(mapping) && !mapping.length) {
-        findings.push(`No User-ID mapping for ${src_ip} on ${dev.hostname}: rules restricted to users/groups cannot match; traffic falls to 'any'-user rules or the default deny.`);
-      } else if (mappedUser && user && !mappedUser.toLowerCase().includes(user.toLowerCase().split("\\").pop()!)) {
-        findings.push(`${src_ip} is mapped to '${mappedUser}', not '${user}': shared IP (Citrix/terminal server/proxy) or stale mapping.`);
-      }
-      const identity = user ?? mappedUser;
-      if (identity) out.user_groups = await userGroups(target, dev.serial, identity).catch((err) => errMsg(err));
+        const mapping = await ipUserMapping(target, dev.serial, src_ip!).catch((err) => errMsg(err));
+        out.user_id_mapping = mapping;
+        const mappedUser = Array.isArray(mapping) ? mapping[0]?.user : undefined;
+        if (Array.isArray(mapping) && !mapping.length) {
+          findings.push(`No User-ID mapping for ${src_ip} on ${dev.hostname}: rules restricted to users/groups cannot match; traffic falls to 'any'-user rules or the default deny.`);
+        } else if (mappedUser && user && !mappedUser.toLowerCase().includes(user.toLowerCase().split("\\").pop()!)) {
+          findings.push(`${src_ip} is mapped to '${mappedUser}', not '${user}': shared IP (Citrix/terminal server/proxy) or stale mapping.`);
+        }
+        const identity = user ?? mappedUser;
+        if (identity) out.user_groups = await userGroups(target, dev.serial, identity).catch((err) => errMsg(err));
 
-      const matchInput = { source: src_ip!, destination, destination_port, protocol: protocol ?? 6, application, source_user: mappedUser ?? user };
-      try {
-        const matched = await testSecurityPolicyMatch(target, dev.serial, matchInput);
-        out.policy_match = matched;
-        const first = matched[0];
-        if (!first) findings.push("test security-policy-match: no rule matches, the default rule applies (interzone-default = deny, not logged by default).");
-        else findings.push(`The firewall matches rule '${first.name ?? JSON.stringify(first)}'${first.action ? ` (action ${first.action})` : ""} for this flow${application ? ` and application ${application}` : ""}.`);
-      } catch (err) {
-        out.policy_match = errMsg(err);
+        try {
+          const matched = await testSecurityPolicyMatch(target, dev.serial, {
+            source: src_ip!,
+            destination,
+            destination_port,
+            protocol: protocol ?? 6,
+            application,
+            source_user: mappedUser ?? user,
+          });
+          out.policy_match = matched;
+          const first = matched[0];
+          if (!first) findings.push("test security-policy-match: no rule matches, the default rule applies (interzone-default = deny, not logged by default).");
+          else findings.push(`The firewall matches rule '${first.name ?? JSON.stringify(first)}'${first.action ? ` (action ${first.action})` : ""} for this flow${application ? ` and application ${application}` : ""}.`);
+        } catch (err) {
+          out.policy_match = errMsg(err);
+        }
+        if (dev.policySync && !/in sync/i.test(dev.policySync)) findings.push(`Device policy status is '${dev.policySync}': Panorama config may differ from the firewall.`);
       }
 
       if (application) {
-        const { locations } = await scopeForDevice(target, dev.serial);
-        const base = application.split("-")[0];
-        const rules = sortByEvaluationOrder(
-          (await fetchRules(target, locations)).filter(
-            (r) => !r.disabled && ruleAppliesToDevice(r, dev.serial) && r.application.some((a) => a === application || a.startsWith(base))
-          ),
+        const [rules, containers, app] = await Promise.all([
+          fetchRules(target, locations),
+          fetchAppContainers(target, locations),
+          predefinedApp(target, application).catch(() => undefined),
+        ]);
+        const inside = app ? containersOf(app, containers) : [];
+        if (app) out.application = { ...app, contained_in: inside.map((c) => ({ kind: c.kind, name: c.name, location: c.location, definition: c.definition })) };
+        const names = new Set([application, ...inside.map((c) => c.name)]);
+        const family = appFamily(application);
+        const relevant = sortByEvaluationOrder(
+          rules.filter((r) => !r.disabled && ruleAppliesToDevice(r, serial) && r.application.some((a) => names.has(a) || appFamily(a) === family)),
           locations
         );
-        out.rules_for_application = rules.map(compactRule);
-        const allowing = rules.filter((r) => r.action === "allow");
-        if (!allowing.length) {
-          findings.push(`No enabled rule applying to ${dev.hostname} explicitly allows '${application}' or related '${base}*' applications: a rule is needed (or the app must be added to an existing rule for the right users).`);
-        } else {
+        out.rules_for_application = relevant.slice(0, 20).map(compactRule);
+
+        const denying = relevant.filter((r) => r.action !== "allow" && r.application.some((a) => names.has(a)));
+        for (const r of denying.slice(0, 3)) {
+          const via = r.application.filter((a) => names.has(a) && a !== application);
           findings.push(
-            `Rules allowing '${base}*' apps: ${allowing.map((r) => `'${r.name}' [${r.application.join(",")}] users=${r.sourceUser.join(",") || "any"}`).join("; ")}. ` +
-              "Check that the exact function (e.g. *-uploading) and the user's group are included before creating a new rule."
+            `Rule '${r.name}' (${r.location}/${r.rulebase} #${r.position}, action ${r.action}) matches '${application}'` +
+              (via.length ? ` through ${via.map((v) => `'${v}' (${inside.find((c) => c.name === v)?.kind ?? "container"})`).join(", ")}` : "") +
+              "."
           );
         }
+        const allowing = relevant.filter((r) => r.action === "allow" && r.application.some((a) => names.has(a)));
+        if (!allowing.length) findings.push(`No enabled rule in scope explicitly allows '${application}' (directly or via a group/filter).`);
+
+        const exceptions = findExceptionRules(rules, { apps: [application] }, denying[0]);
+        out.existing_exception_rules = exceptions.map(compactRule);
+        const pattern = exceptionPattern(exceptions);
+        if (pattern) findings.push(pattern);
+        if (denying[0]) findings.push(`An exception must be placed before '${denying[0].name}' in ${denying[0].location}/${denying[0].rulebase}.`);
       }
 
       const logs = await gatherLogs(target, [
@@ -440,7 +572,6 @@ export function registerDiagnoseTools(server: McpServer) {
       if (!groups.length) findings.push(...NO_LOG_HINTS);
       for (const g of groups.filter((g) => g.blocked || g.layer !== "none").slice(0, 5)) findings.push(`Logs: ${g.summary} (x${g.count}, last ${g.last_seen}).`);
       if (Object.keys(logs.errors).length) out.log_errors = logs.errors;
-      if (dev.policySync && !/in sync/i.test(dev.policySync)) findings.push(`Device policy status is '${dev.policySync}': Panorama config may differ from the firewall.`);
 
       return jsonResponse({ findings, ...out });
     }

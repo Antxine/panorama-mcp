@@ -1,6 +1,6 @@
 import type { FirewallTarget } from "./client.js";
-import { locationsToSearch, type ManagedDevice } from "./panorama.js";
-import { describePick, pickDevice, type DeviceHints } from "./device.js";
+import { type ManagedDevice } from "./panorama.js";
+import { describePick, originFromLogs, pickDevice, prismaDeviceGroup, type DeviceHints } from "./device.js";
 import { testUrl } from "./ops.js";
 import {
   compactRule,
@@ -12,6 +12,8 @@ import {
   ruleAppliesToDevice,
   scopeForDevice,
   scopeForDeviceGroup,
+  allLocations,
+  listDeviceGroupNames,
   sortByEvaluationOrder,
   type CustomUrlCategory,
   type RuleSummary,
@@ -27,12 +29,15 @@ export interface Scope {
   deviceGroup?: string;
   /** Config locations in inheritance order (shared -> ancestors -> device group). */
   locations: string[];
+  /** How the scope was determined, when it is not obvious (e.g. Prisma Access). */
+  note?: string;
 }
 
 /**
  * Config scope of an analysis. A device group is read with everything it inherits;
- * a firewall (explicit or inferred from the user's logs) with the chain of its device group.
- * `live` lets a firewall be picked for live lookups even when reasoning per device group.
+ * a firewall (explicit, or inferred from the user's/IP's logs) with the chain of its device group.
+ * Prisma Access traffic maps to its device group. `live.anyConnected` also picks a firewall for
+ * PAN-DB lookups when reasoning per device group.
  */
 export async function resolveScope(
   target: FirewallTarget,
@@ -40,18 +45,37 @@ export async function resolveScope(
   deviceGroup?: string,
   live: Omit<DeviceHints, "device" | "device_group"> = {}
 ): Promise<Scope> {
-  if (device || (!deviceGroup && (live.src_ip || live.user))) {
-    const pick = await pickDevice(target, { device, ...live }).catch(() => undefined);
+  if (device) {
+    const pick = await pickDevice(target, { device });
+    const scope = await scopeForDevice(target, pick.device.serial);
+    return { device: pick.device, deviceDescription: describePick(pick), ruleSerial: pick.device.serial, ...scope };
+  }
+
+  if (!deviceGroup && (live.origin || live.src_ip || live.user)) {
+    const origin = live.origin ?? (await originFromLogs(target, live.src_ip, live.user));
+    const pick = origin ? await pickDevice(target, { origin }).catch(() => undefined) : undefined;
     if (pick) {
       const scope = await scopeForDevice(target, pick.device.serial);
       return { device: pick.device, deviceDescription: describePick(pick), ruleSerial: pick.device.serial, ...scope };
     }
-    if (device) await pickDevice(target, { device }); // rethrow the explicit-device error
+    const prismaGroup = prismaDeviceGroup(origin?.deviceName, await listDeviceGroupNames(target));
+    if (prismaGroup) {
+      const scope = await scopeForDeviceGroup(target, prismaGroup);
+      const panDb = live.anyConnected ? await pickDevice(target, { anyConnected: true }).catch(() => undefined) : undefined;
+      return {
+        ...scope,
+        device: panDb?.device,
+        deviceDescription: panDb ? describePick(panDb) : undefined,
+        note: `Traffic handled by Prisma Access ('${origin?.deviceName}'): policies read from device group '${prismaGroup}' and what it inherits; live User-ID/test commands are not available.`,
+      };
+    }
   }
 
-  const base = deviceGroup ? await scopeForDeviceGroup(target, deviceGroup) : { locations: await locationsToSearch(target) };
+  const base = deviceGroup ? await scopeForDeviceGroup(target, deviceGroup) : { locations: await allLocations(target) };
   if (!deviceGroup && !live.anyConnected) return base;
-  const pick = await pickDevice(target, { device_group: deviceGroup, anyConnected: live.anyConnected }).catch(() => undefined);
+  const pick = await pickDevice(target, { device_group: deviceGroup, anyConnected: live.anyConnected }).catch(() =>
+    live.anyConnected ? pickDevice(target, { anyConnected: true }).catch(() => undefined) : undefined
+  );
   return { ...base, device: pick?.device, deviceDescription: pick ? describePick(pick) : undefined };
 }
 
@@ -125,6 +149,8 @@ export async function analyzeUrl(
 
 export interface CategoryUsage {
   rules: RuleSummary[];
+  /** Every enabled-or-not security/decryption rule applying in scope, for further analysis. */
+  allRules: RuleSummary[];
   profiles: Array<{
     profile: string;
     location: string;
@@ -168,7 +194,7 @@ export async function categoryUsage(
       .map((r) => `${r.location}/${r.rulebase}:${r.name}`);
     usage.push({ profile: p.name, location: p.location, actions, credential_actions: credential, used_by_rules: usedBy });
   }
-  return { rules: referencing, profiles: usage };
+  return { rules: referencing, profiles: usage, allRules: applicable };
 }
 
 /** Deterministic conclusions for a URL, so the model does not suggest duplicating existing config. */

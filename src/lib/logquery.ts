@@ -57,6 +57,20 @@ function assertSafeLiteral(value: string, field: string): void {
   if (/['()]/.test(value)) throw new Error(`${field} must not contain quotes or parentheses`);
 }
 
+/**
+ * PAN-OS only supports exact match on user.src, so the identity must be complete:
+ * UPN for GlobalProtect/Prisma Access users, DOMAIN\\id for AD/Citrix users.
+ */
+export function assertFullIdentity(user: string): string {
+  if (!/[@\\]/.test(user)) {
+    throw new Error(
+      `user '${user}' must be the identity exactly as logged: 'name@domain' (GlobalProtect/Prisma) or 'DOMAIN\\id' (AD/Citrix). ` +
+        "Unknown? Search by src_ip, or by the blocked URL (log_type=url, url_contains) and read srcuser in the results."
+    );
+  }
+  return user;
+}
+
 /** Builds a PAN-OS log filter from structured filters. Throws on invalid input. */
 export function buildLogQuery(logType: LogType, f: LogFilters): BuiltLogQuery {
   const terms: string[] = [];
@@ -85,10 +99,16 @@ export function buildLogQuery(logType: LogType, f: LogFilters): BuiltLogQuery {
     if (value) assertSafeLiteral(value, name);
   }
 
+  if (f.url_contains && logType !== "url") {
+    throw new Error(
+      "url_contains only works on url logs (other log types have no URL field): search log_type=url first, then filter other logs by dst_ip/src_ip"
+    );
+  }
+
   if (sessionLog) {
     if (f.src_ip) terms.push(`( addr.src in ${f.src_ip} )`);
     if (f.dst_ip) terms.push(`( addr.dst in ${f.dst_ip} )`);
-    if (f.user) terms.push(`( user.src contains '${f.user}' )`);
+    if (f.user) terms.push(`( user.src eq '${assertFullIdentity(f.user)}' )`);
     if (f.dst_port !== undefined) terms.push(`( port.dst eq ${f.dst_port} )`);
     if (f.app) terms.push(`( app eq ${f.app} )`);
     if (f.rule) terms.push(`( rule eq '${f.rule}' )`);

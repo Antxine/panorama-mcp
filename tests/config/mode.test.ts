@@ -12,8 +12,11 @@ describe("isReadOnlyMode", () => {
 
 describe("selectedModules", () => {
   const all = ["firewalls", "panorama", "utility", "debug", "urlcategories", "diagnose", "nat"];
-  it("defaults to all modules", () => {
-    expect(selectedModules(all, {})).toEqual(all);
+  it("defaults to the panorama-debug preset", () => {
+    expect(selectedModules(all, {})).toEqual(PANORAMA_DEBUG_PRESET);
+  });
+  it("loads everything with 'all'", () => {
+    expect(selectedModules(all, { PANOS_MODULES: "all" })).toEqual(all);
   });
   it("expands the panorama-debug preset", () => {
     expect(selectedModules(all, { PANOS_MODULES: "panorama-debug" })).toEqual(PANORAMA_DEBUG_PRESET);

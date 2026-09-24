@@ -19,6 +19,8 @@ import { classifyLogEntry } from "../lib/classify.js";
 import { NO_LOG_HINTS } from "../lib/correlate.js";
 import { ipInEntry } from "../lib/ip.js";
 import { trimLogEntry } from "../lib/logquery.js";
+import { summarizeLogs } from "../lib/summarize.js";
+import { containersOf, fetchAppContainers, predefinedApp } from "../api/apps.js";
 import { matchEntry } from "../lib/urlmatch.js";
 import { firewallName, xmlEscape } from "../schemas/panos.js";
 import {
@@ -38,6 +40,30 @@ export const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorld
 const panoramaEntry = firewallName.describe(
   "Panorama entry from firewalls.json. Optional when a single Panorama is configured."
 );
+
+const OBJECT_XPATHS = {
+  "profile-group": "profile-group",
+  "url-filtering-profile": "profiles/url-filtering",
+  "antivirus-profile": "profiles/virus",
+  "anti-spyware-profile": "profiles/spyware",
+  "vulnerability-profile": "profiles/vulnerability",
+  "file-blocking-profile": "profiles/file-blocking",
+  "wildfire-profile": "profiles/wildfire-analysis",
+  "decryption-profile": "profiles/decryption",
+  "custom-url-category": "profiles/custom-url-category",
+  application: "application",
+  "application-group": "application-group",
+  "application-filter": "application-filter",
+  schedule: "schedule",
+  tag: "tag",
+  "log-forwarding-profile": "log-settings/profiles",
+  edl: "external-list",
+  address: "address",
+  "address-group": "address-group",
+  service: "service",
+  "service-group": "service-group",
+} as const;
+const OBJECT_TYPES = Object.keys(OBJECT_XPATHS) as [keyof typeof OBJECT_XPATHS, ...Array<keyof typeof OBJECT_XPATHS>];
 
 const optionalDevice = managedDevice
   .optional()
@@ -96,7 +122,7 @@ export function registerDebugTools(server: McpServer) {
 
   server.tool(
     "search_logs",
-    "[READ-ONLY] Searches logs stored on Panorama (traffic, threat, url, wildfire, data, globalprotect, userid, auth, decryption, system) with structured filters and a time window. Returns trimmed entries, each with a '_why' explanation of what blocked it. Structured filters are server-side for traffic/threat/url/wildfire/data/decryption; for other types user and src_ip are matched locally.",
+    "[READ-ONLY] Low-level log search (for a ticket, start with diagnose_user_blocks instead). Searches logs stored on Panorama (traffic, threat, url, wildfire, data, globalprotect, userid, auth, decryption, system). Returns a 'summary' grouping matching events (same destination/action/rule/category...) with counts, users and sources, plus a few raw 'entries' each explained in '_why'. 'user' must be the exact logged identity (name@domain or DOMAIN\\id); 'url_contains' only works on url logs. Keep the window short (incident_time in diagnose tools, or last-24-hrs): 30-day searches time out.",
     {
       log_type: logType,
       src_ip: z.string().max(49).optional().describe("Source IP or CIDR"),
@@ -107,13 +133,13 @@ export function registerDebugTools(server: McpServer) {
       rule: z.string().max(127).optional().describe("Security rule name"),
       action: z.string().max(31).optional().describe("Exact action (allow, deny, drop, block-url, reset-both, ...)"),
       only_blocked: z.boolean().optional().describe("Only non-allowed events"),
-      url_contains: z.string().max(255).optional().describe("Substring of the URL (url/threat logs)"),
+      url_contains: z.string().max(255).optional().describe("Substring of the URL (log_type=url only)"),
       period: logPeriod,
       start_time: z.string().optional().describe("Absolute start 'YYYY/MM/DD HH:MM:SS' (Panorama timezone); overrides period"),
       end_time: z.string().optional().describe("Absolute end 'YYYY/MM/DD HH:MM:SS'"),
       query: z.string().max(1024).optional().describe("Extra raw PAN-OS filter, ANDed (e.g. \"( severity geq high )\")"),
-      max_results: maxResults,
-      all_fields: z.boolean().optional().describe("Return every log field instead of the useful subset"),
+      max_results: z.number().int().min(1).max(200).optional().describe("Raw entries returned (default 10); the summary covers up to 500 matches"),
+      all_fields: z.boolean().optional().describe("Return every log field in raw entries"),
       firewall: panoramaEntry,
     },
     { title: "Search Logs", ...READ_ONLY },
@@ -122,12 +148,14 @@ export function registerDebugTools(server: McpServer) {
         panoramaTarget(firewall),
         log_type,
         { ...filters, start_time, period: period ?? (start_time ? undefined : "last-24-hrs") },
-        max_results ?? 50
+        500
       );
       return jsonResponse({
         query: result.query,
         matched: result.matched,
-        entries: result.entries.map((e) => {
+        ...(result.partial ? { partial: "Query timed out: only the logs received so far are included. Narrow the window for complete results." } : {}),
+        summary: summarizeLogs(log_type, result.entries),
+        entries: result.entries.slice(0, max_results ?? 10).map((e) => {
           const why = classifyLogEntry(log_type, e).summary;
           return { ...trimLogEntry(log_type, e, all_fields), ...(why ? { _why: why } : {}) };
         }),
@@ -295,6 +323,82 @@ export function registerDebugTools(server: McpServer) {
         rules: rules.slice(0, max_results ?? 50).map(compactRule),
         note: "Panorama running config. Local firewall rules and unpushed changes are not included.",
       });
+    }
+  );
+
+  server.tool(
+    "resolve_application",
+    "[READ-ONLY] Explains an application name used in rules or logs: whether it is a custom application (with its signatures), an application group, an application filter (with its criteria) or a predefined App-ID (category, subcategory, risk, tags), which groups/filters contain an App-ID (e.g. why 'adobe-podcast' falls in a GenAI block filter), and the rules referencing it or its containers.",
+    {
+      name: z.string().min(1).max(63).regex(/^[^'"<>]+$/).describe("App-ID, application group or application filter name"),
+      device_group: deviceGroupFilter,
+      firewall: panoramaEntry,
+    },
+    { title: "Resolve Application", ...READ_ONLY },
+    async ({ name, device_group, firewall }) => {
+      const target = panoramaTarget(firewall);
+      const scope = await resolveScope(target, undefined, device_group);
+      const [containers, rules] = await Promise.all([fetchAppContainers(target, scope.locations), fetchRules(target, scope.locations)]);
+      const referencing = (names: string[]) =>
+        sortByEvaluationOrder(
+          rules.filter((r) => !r.disabled && r.application.some((a) => names.includes(a))),
+          scope.locations
+        )
+          .slice(0, 20)
+          .map(compactRule);
+
+      const own = containers.filter((c) => c.name === name);
+      if (own.length) {
+        return jsonResponse({ scope: scope.locations, definitions: own, rules_using_it: referencing([name]) });
+      }
+      const app = await predefinedApp(target, name);
+      if (!app) {
+        return jsonResponse({ name, found: false, note: "Not an application group/filter in scope nor a predefined App-ID: may be a custom application (see get_config_xpath) or a typo." });
+      }
+      const inside = containersOf(app, containers);
+      return jsonResponse({
+        scope: scope.locations,
+        app,
+        contained_in: inside.map((c) => ({ kind: c.kind, name: c.name, location: c.location, definition: c.definition })),
+        rules_referencing_app_or_containers: referencing([name, ...inside.map((c) => c.name)]),
+      });
+    }
+  );
+
+  server.tool(
+    "find_objects",
+    "[READ-ONLY] Checks that objects exist before proposing them, and finds reusable ones: searches by name in security profile groups, security profiles, custom URL categories, applications (custom, groups, filters), schedules, tags, log forwarding profiles, EDLs, addresses and services. Returns type, name and location.",
+    {
+      name_contains: z.string().min(2).max(63).regex(/^[^'"<>]+$/).describe("Case-insensitive part of the name"),
+      types: z.array(z.enum(OBJECT_TYPES)).optional().describe("Restrict to these object types (default: all)"),
+      device_group: deviceGroupFilter,
+      firewall: panoramaEntry,
+    },
+    { title: "Find Objects", ...READ_ONLY },
+    async ({ name_contains, types, device_group, firewall }) => {
+      const target = panoramaTarget(firewall);
+      const scope = await resolveScope(target, undefined, device_group);
+      const needle = name_contains.toLowerCase();
+      const wanted = types?.length ? types : [...OBJECT_TYPES];
+      const found: Array<{ type: string; name: string; location: string; detail?: unknown }> = [];
+      await Promise.all(
+        scope.locations.flatMap((location) =>
+          wanted.map(async (type) => {
+            for (const e of await readEntries(target, location, OBJECT_XPATHS[type]).catch(() => [])) {
+              const name = nodeText(e["@_name"]);
+              if (!name.toLowerCase().includes(needle)) continue;
+              const detail =
+                type === "profile-group"
+                  ? Object.fromEntries(Object.entries(e).filter(([k]) => !k.startsWith("@_")).map(([k, v]) => [k, (v as any)?.member ?? v]))
+                  : type === "schedule"
+                    ? e["schedule-type"]
+                    : undefined;
+              found.push({ type, name, location, ...(detail ? { detail } : {}) });
+            }
+          })
+        )
+      );
+      return jsonResponse({ scope: scope.locations, total: found.length, objects: found.slice(0, 100) });
     }
   );
 

@@ -13,8 +13,16 @@ export function panoramaTarget(firewall?: string): FirewallTarget {
 /** Runs an op command (optionally proxied to a managed firewall) and returns its `result` or throws. */
 export async function op(target: FirewallTarget, cmd: string, serial?: string): Promise<any> {
   const result = await executeOpCommand(cmd, target, serial);
-  if (!result.success) throw new Error(result.error);
+  if (!result.success) throw new Error(explainApiError(result.error));
   return result.data;
+}
+
+/** Turns PAN-OS permission errors into an actionable message. */
+export function explainApiError(error = "Unknown PanOS error"): string {
+  const denied = /Type \[(\w+)\] not authorized/i.exec(error);
+  if (!denied) return error;
+  const permission: Record<string, string> = { op: "Operational Requests", log: "Log", config: "Configuration" };
+  return `${error} -> the Panorama admin role of the API key lacks the XML API permission '${permission[denied[1]] ?? denied[1]}'. Tools relying on it are unavailable until the role is updated.`;
 }
 
 /** `<a><b>value</b></a>`-style helper for building op commands with escaped leaf values. */
@@ -27,6 +35,8 @@ export interface LogSearchResult {
   entries: Array<Record<string, any>>;
   /** Number of entries matching before truncation to max results. */
   matched: number;
+  /** The query did not finish in time: entries are only the logs received so far. */
+  partial?: boolean;
 }
 
 /**
@@ -46,12 +56,12 @@ export async function searchLogs(
   const nlogs = localFiltering ? 2000 : Math.min(maxResults, 5000);
 
   const result = await executeLogQuery(logType, nlogs, built.query || undefined, target);
-  if (!result.success) throw new Error(result.error);
+  if (!result.success) throw new Error(explainApiError(result.error));
 
   let entries = asArray<Record<string, any>>(result.data?.entry);
   if (built.clientSide.user || built.clientSide.ip) entries = entries.filter((e) => entryMatches(e, built.clientSide));
   if (extraFilter) entries = entries.filter(extraFilter);
-  return { query: built.query, entries: entries.slice(0, maxResults), matched: entries.length };
+  return { query: built.query, entries: entries.slice(0, maxResults), matched: entries.length, ...(result.partial ? { partial: true } : {}) };
 }
 
 /** Parses `test url` output lines like "www.x.com search-engines,low-risk (Cloud db)". */

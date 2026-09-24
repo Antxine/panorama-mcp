@@ -17,15 +17,18 @@ Rules:
 - Separate observed facts (quote the log/rule) from hypotheses. Do not invent rule, profile or category names.
 - The site in the ticket is not necessarily the blocked one: uploads, storage, CDN, APIs and SSO often live on other domains.
 - No log does not mean no block: see the visibility pitfalls in the playbook (resource panorama://playbook).
+- Evidence must belong to the ticket's user. If you use logs of other users (found by URL or application), say so explicitly and confirm the user's identity or IP.
+- Before naming a profile group, profile, category, application, schedule or tag in a proposal, check that it exists (find_objects / resolve_application). Base new exception rules on the existing ones returned as existing_exception_rules (same device group, position before the enforcing rule, same profile group, schedule and naming convention, ticket number in description).
+- Keep log windows short: use incident_time (+/-30 min) or last-24-hrs. 30-day searches time out.
 - This server is read-only: describe changes for a human to apply in Panorama, then commit and push.
 - Consult the playbook resource for less common cases.`;
 
 /** Method and answer format for a ticket; exposed as a tool because not every MCP client supports prompts. */
 export const TICKET_METHOD = `Ticket diagnosis method:
-1. List the facts from the ticket (user, IP, site/URL, action attempted, time, location/VPN). Say which ones are missing.
-2. Run diagnose_user_blocks (user and/or IP, reported_url, incident_time if known).
-3. Drill down on the blocking layer: diagnose_url_access, diagnose_threat_block or diagnose_flow. Read get_troubleshooting_playbook if the cause is unclear.
-4. Answer in the ticket's language with these sections: Summary / Evidence (quote logs and rules) / Root cause (confidence level) / Recommended fix (minimal, reusing existing categories, rules and profiles) / What to ask the user if data is missing.
+1. List the facts from the ticket: user (and its exact logged identity if known), IP, requested site/URL, block page URL and category if a screenshot is described, action attempted (browse, upload, download, app), time, location (office, Citrix, GlobalProtect). Say which ones are missing.
+2. Run diagnose_user_blocks with what you have: user and/or src_ip, reported_url, blocked_url, incident_time. If it returns need_identity, pick the identity or ask the human.
+3. Drill down on the blocking layer: diagnose_url_access (URL filtering), diagnose_threat_block (files, signatures), diagnose_flow (policy deny, App-ID, apps like GenAI). Use resolve_application and find_objects to check names. Read get_troubleshooting_playbook if the cause is unclear.
+4. Answer in the ticket's language with these sections: Summary / Evidence (quote logs and rules, say whose logs they are) / Root cause (confidence level) / Recommended fix (minimal; extend an existing exception rule or copy its pattern; only objects verified to exist; device group and position) / Risk / What to ask the user if data is missing.
 Never propose creating something that already covers the need. If the reported site is not the blocked one, say so explicitly.`;
 
 export const PLAYBOOK = `# Panorama troubleshooting playbook
@@ -35,7 +38,10 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
 - interzone-default / intrazone-default do not log by default. A silent deny often means that no explicit rule matched.
 - URL filtering does not log categories whose action is 'allow'. Only alert/block/continue/override show up.
 - Log times are in Panorama's timezone, and forwarding can lag. Widen the window before concluding.
-- User names differ between sources (domain\\user, UPN, lowercase). Search by source IP when unsure.
+- User names differ between sources and log searches need the exact identity:
+  - GlobalProtect and Prisma Access users are logged by UPN (name@domain, external users often name-external@domain).
+  - Citrix and AD-mapped users are logged as DOMAIN\\id (for example emea\\u123456) behind shared Citrix IPs.
+  - When only a display name is known, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
 
 ## Third-party dependencies (ABC.com works but upload fails)
 - Web apps call other domains for uploads, storage, APIs, CDN, auth: S3, Azure Blob, GCS, CloudFront, Akamai, SharePoint, OneDrive, Box, Dropbox, and Okta/Entra ID for SSO.
@@ -85,6 +91,16 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
   - group not in the group include list
   - group mapping not refreshed after an AD change
 - Rules with a HIP profile require GlobalProtect HIP data. hipmatch logs show whether the host matched.
+
+## Prisma Access
+- Logs from device_name 'GP cloud service' (mobile users) or 'RN-...' (remote networks) come from Prisma Access, not from managed firewalls.
+- Their policies come from the Prisma device groups (Mobile_User_Device_Group, Remote_Network_Device_Group) and what those groups inherit.
+- Live commands (User-ID lookup, test security-policy-match, sessions) are not available. Rely on logs and config.
+
+## Applications
+- A rule's application field can hold a custom application, an application group or an application filter.
+- Use resolve_application to see which one it is, and why an App-ID falls into a deny rule (for example a GenAI filter).
+- Allow exceptions must use the specific App-ID seen in the logs, not the whole group or filter.
 
 ## Other layers
 - Decryption errors (decryption logs, session_end_reason decrypt-*): certificate pinning, mutual TLS, or unsupported ciphers. The fix is a targeted no-decrypt rule.

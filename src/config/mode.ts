@@ -2,10 +2,12 @@
  * Runtime mode from environment variables.
  *
  * PANOS_READ_ONLY (default "true"): only tools annotated readOnlyHint are registered.
- * PANOS_MODULES (default "all"): comma-separated module names, or the "panorama-debug" preset.
+ * PANOS_MODULES (default "panorama-debug"): "all", comma-separated module names, or the "panorama-debug" preset.
+ * The preset is the default because upstream firewall-level tools confuse the model on a Panorama.
  */
 
-export const PANORAMA_DEBUG_PRESET = ["firewalls", "panorama", "utility", "debug", "urlcategories", "diagnose"];
+// "panorama" (upstream raw config dumps) is left out: its outputs are huge and covered by debug/diagnose tools.
+export const PANORAMA_DEBUG_PRESET = ["firewalls", "utility", "debug", "urlcategories", "diagnose"];
 
 export function isReadOnlyMode(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env.PANOS_READ_ONLY ?? "true").trim().toLowerCase();
@@ -13,10 +15,10 @@ export function isReadOnlyMode(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 export function selectedModules(available: string[], env: NodeJS.ProcessEnv = process.env): string[] {
-  const raw = (env.PANOS_MODULES ?? "all").trim().toLowerCase();
-  if (!raw || raw === "all") return available;
+  const raw = (env.PANOS_MODULES ?? "panorama-debug").trim().toLowerCase();
+  if (raw === "all") return available;
 
-  const requested = raw
+  const requested = (raw || "panorama-debug")
     .split(",")
     .map((m) => m.trim())
     .filter(Boolean)

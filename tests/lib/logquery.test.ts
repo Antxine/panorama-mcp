@@ -5,13 +5,13 @@ describe("buildLogQuery", () => {
   it("builds server-side filters for traffic logs", () => {
     const { query, clientSide } = buildLogQuery("traffic", {
       src_ip: "10.1.2.3",
-      user: "jdoe",
+      user: "jdoe@corp.com",
       dst_port: 443,
       only_blocked: true,
       period: "last-hour",
     });
     expect(query).toBe(
-      "( receive_time in last-hour ) and ( addr.src in 10.1.2.3 ) and ( user.src contains 'jdoe' ) and ( port.dst eq 443 ) and ( action neq allow )"
+      "( receive_time in last-hour ) and ( addr.src in 10.1.2.3 ) and ( user.src eq 'jdoe@corp.com' ) and ( port.dst eq 443 ) and ( action neq allow )"
     );
     expect(clientSide).toEqual({});
   });
@@ -46,6 +46,16 @@ describe("buildLogQuery", () => {
     [{ start_time: "2026-09-23 10:00" }, /format/],
   ])("rejects invalid input %j", (filters, error) => {
     expect(() => buildLogQuery("traffic", filters)).toThrow(error);
+  });
+
+  it("requires a complete identity for session logs", () => {
+    expect(() => buildLogQuery("traffic", { user: "jdoe" })).toThrow(/exactly as logged/);
+    expect(buildLogQuery("traffic", { user: "emea\\u123456" }).query).toBe("( user.src eq 'emea\\u123456' )");
+  });
+
+  it("only allows url_contains on url logs", () => {
+    expect(buildLogQuery("url", { url_contains: "yumpu.com" }).query).toBe("( url contains 'yumpu.com' )");
+    expect(() => buildLogQuery("traffic", { url_contains: "yumpu.com" })).toThrow(/only works on url logs/);
   });
 
   it("accepts CIDR sources", () => {
