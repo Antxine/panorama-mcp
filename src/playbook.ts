@@ -29,7 +29,8 @@ export const TICKET_METHOD = `Ticket diagnosis method:
 2. Run diagnose_user_blocks with what you have: user and/or src_ip, reported_url, blocked_url, incident_time. If it returns need_identity, pick the identity or ask the human.
 3. Drill down on the blocking layer: diagnose_url_access (URL filtering), diagnose_threat_block (files, signatures), diagnose_flow (policy deny, App-ID, apps like GenAI). Use resolve_application and find_objects to check names. Read get_troubleshooting_playbook if the cause is unclear.
 4. Answer in the ticket's language with these sections: Summary / Evidence (quote logs and rules, say whose logs they are) / Root cause (confidence level) / Recommended fix (minimal; extend an existing exception rule or copy its pattern; only objects verified to exist; device group and position) / Risk / What to ask the user if data is missing.
-Never propose creating something that already covers the need. If the reported site is not the blocked one, say so explicitly.`;
+Never propose creating something that already covers the need. If the reported site is not the blocked one, say so explicitly.
+When diagnose tools return fix_options, present the relevant ones as options with their impact (who else gets access), recommend one and explain why; they are suggestions, not certainties.`;
 
 export const PLAYBOOK = `# Panorama troubleshooting playbook
 
@@ -44,7 +45,7 @@ export const PLAYBOOK = `# Panorama troubleshooting playbook
   - ad_lookup_user (when available) turns an email or display name into every log identity and lists the user's AD groups; diagnose_user_blocks uses it automatically.
   - Without AD, run diagnose_user_blocks with blocked_url or reported_url: it lists the identities seen for that URL. Otherwise ask for the ID or the source IP.
 - Group-based rules: ad_user_rules lists the rules targeting the user through their AD groups (nested included) and, with 'contains', the relevant rules reserved to other groups with the group the user lacks. The usual fix is then adding the user to the existing group (identity team), not a new rule.
-- Groups in rules may come from the Cloud Identity Engine (Entra DN like CN=...,DC=tenant,DC=onmicrosoft,DC=com); cloud-only groups are not visible in on-prem AD.
+- Groups in rules may come from the Cloud Identity Engine (Entra DN like CN=...,DC=tenant,DC=onmicrosoft,DC=com). Cloud-only groups are not in on-prem AD: entra_user_groups (Azure CLI) returns them, and ad_user_rules/diagnose tools merge both sources automatically.
 
 ## Third-party dependencies (ABC.com works but upload fails)
 - Web apps call other domains for uploads, storage, APIs, CDN, auth: S3, Azure Blob, GCS, CloudFront, Akamai, SharePoint, OneDrive, Box, Dropbox, and Okta/Entra ID for SSO.

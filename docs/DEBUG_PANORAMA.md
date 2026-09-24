@@ -68,6 +68,8 @@ Le modèle suit cette méthode :
    - `diagnose_flow` : mapping User-ID et groupes, règle réellement matchée par le firewall (`test security-policy-match`), règles qui autorisent l'application (y compris les fonctions `*-uploading`).
 4. **Conclusion** : preuves, cause racine, niveau de confiance, correctif minimal qui réutilise l'existant, et informations à demander à l'utilisateur si des données manquent.
 
+`diagnose_url_access` et `diagnose_flow` renvoient aussi des `fix_options`, des pistes classées de la plus petite modification de l'existant à la nouvelle règle, chacune avec son impact (qui d'autre obtient l'accès). Par exemple : « ajouter l'App-ID adobe-podcast à la règle X qui s'applique déjà à son groupe et autorise d'autres apps Adobe ». Ce sont des suggestions : l'intention et le propriétaire de chaque règle restent à vérifier.
+
 ## Identités utilisateur
 
 PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la source :
@@ -76,7 +78,7 @@ PAN-OS ne permet qu'une correspondance **exacte** sur l'utilisateur. Selon la so
 
 Sur un PC Windows du domaine, l'outil `ad_lookup_user` interroge l'Active Directory avec ta session. À partir d'un e-mail, d'un `DOMAINE\id` ou d'un « Prénom Nom », il renvoie le compte, les groupes AD et les identités telles qu'elles apparaissent dans les logs. `diagnose_user_blocks` s'en sert automatiquement : avec un e-mail, il cherche les logs sous l'UPN **et** sous `DOMAINE\id`.
 
-L'outil `ad_user_rules` croise les groupes AD de l'utilisateur, groupes imbriqués compris, avec le `source_user` des règles. Il liste les règles qui le visent déjà, et par quel groupe. Avec `contains` (application, catégorie…), il liste aussi les règles pertinentes réservées à d'autres groupes, avec le groupe qui lui manque. Souvent, la bonne correction est alors d'**ajouter l'utilisateur au groupe existant**, pas de créer une règle. Les groupes Entra ID purement cloud (Cloud Identity Engine) ne sont pas visibles dans l'AD on-prem.
+L'outil `ad_user_rules` croise les groupes AD de l'utilisateur, groupes imbriqués compris, avec le `source_user` des règles. Il liste les règles qui le visent déjà, et par quel groupe. Avec `contains` (application, catégorie…), il liste aussi les règles pertinentes réservées à d'autres groupes, avec le groupe qui lui manque. Souvent, la bonne correction est alors d'**ajouter l'utilisateur au groupe existant**, pas de créer une règle. Les groupes Entra ID purement cloud (Cloud Identity Engine) ne sont pas dans l'AD on-prem. L'outil `entra_user_groups` les récupère avec la session Azure CLI du poste (`az ad user get-member-groups`, groupes transitifs), et les outils ci-dessus fusionnent automatiquement AD et Entra. Prérequis : Azure CLI installé et `az login` fait.
 
 Sans AD, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le site demandé (`reported_url`) : l'outil liste les identités vues pour cette URL.
 
@@ -87,6 +89,7 @@ Sans AD, donne à `diagnose_user_blocks` l'URL bloquée (`blocked_url`) ou le si
 | `PANOS_READ_ONLY` | `true` | `false` réactive les outils d'écriture de Palo-MCP |
 | `PANOS_MODULES` | `panorama-debug` | `all` charge aussi les outils de Palo-MCP pensés pour les firewalls isolés |
 | `PANOS_AD_LOOKUP` | `auto` | Recherche AD : active sous Windows, `false` pour la désactiver, `true` pour la forcer |
+| `PANOS_ENTRA_LOOKUP` | `auto` | Groupes Entra ID via Azure CLI ; `false` pour désactiver |
 | `PANOS_LOG_TIMEOUT` | `120` | Délai maximal d'une requête de logs, en secondes ; au-delà, les résultats partiels sont renvoyés |
 
 ## Limites connues

@@ -290,5 +290,5 @@ export function describeUserRestriction(sourceUser: string[], membership?: Membe
   if (m.unrestricted) return `source_user ${shown} does not restrict by identity`;
   return m.matchedBy.length
     ? `applies to the user (matched by ${m.matchedBy.join(", ")})`
-    : `does NOT apply to the user: not in ${shown} (per AD, including nested groups)`;
+    : `does NOT apply to the user: not in ${shown} (per the known AD/Entra groups)`;
 }

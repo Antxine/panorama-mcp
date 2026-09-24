@@ -115,3 +115,43 @@ export async function adMembership(user: string): Promise<{ user: AdLookupResult
   const u = result.users[0];
   return { user: u, identities: u.log_identities, groups: u.groupDns };
 }
+
+/**
+ * Everything known about a user's identity for rule matching: on-prem AD (identities, nested
+ * groups) and Entra ID groups (cloud-only included). Sources that are unavailable are skipped.
+ */
+export async function userMembership(
+  user: string
+): Promise<{ identities: string[]; groups: string[]; displayName?: string; sources: string[]; warnings: string[] } | undefined> {
+  const { entraGroups, entraLookupEnabled } = await import("./entra.js");
+  const warnings: string[] = [];
+  const sources: string[] = [];
+  let identities: string[] = [];
+  let groups: string[] = [];
+  let displayName: string | undefined;
+
+  try {
+    const ad = await adMembership(user);
+    if (ad) {
+      identities = ad.identities;
+      groups = ad.groups;
+      displayName = ad.user.displayName;
+      sources.push("active-directory");
+    }
+  } catch (err) {
+    warnings.push(err instanceof Error ? err.message : String(err));
+  }
+
+  const upn = identities.find((i) => i.includes("@")) ?? (user.includes("@") ? user : undefined);
+  if (upn && entraLookupEnabled()) {
+    try {
+      groups = [...new Set([...groups, ...(await entraGroups(upn))])];
+      sources.push("entra-id");
+      if (!identities.length) identities = [upn.toLowerCase()];
+    } catch (err) {
+      warnings.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (!sources.length) return undefined;
+  return { identities, groups, displayName, sources, warnings };
+}

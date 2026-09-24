@@ -4,7 +4,7 @@ import type { FirewallTarget } from "../api/client.js";
 import { jsonResponse, nodeText, resolveDevice } from "../api/panorama.js";
 import { describePick, originOf, pickDevice } from "../api/device.js";
 import { containersOf, fetchAppContainers, predefinedApp } from "../api/apps.js";
-import { adLookupEnabled, adLookupUser, adMembership } from "../api/ad.js";
+import { adLookupEnabled, adLookupUser, userMembership } from "../api/ad.js";
 import { describeUserRestriction } from "../api/urlanalysis.js";
 import { ipUserMapping, logTime, panoramaTarget, searchLogs, testSecurityPolicyMatch, userGroups } from "../api/ops.js";
 import {
@@ -24,6 +24,8 @@ import {
 import { analyzeUrl, categoryUsage, resolveScope, summarizeUsage, urlFindings } from "../api/urlanalysis.js";
 import { classifyLogEntry, isBlockingAction } from "../lib/classify.js";
 import { summarizeLogs } from "../lib/summarize.js";
+import { suggestAppFixes, suggestUrlFixes } from "../lib/fixes.js";
+import type { Membership } from "../lib/groups.js";
 import { groupEvents, NO_LOG_HINTS, reportedSiteFindings, type LogEvent } from "../lib/correlate.js";
 import { assertFullIdentity, trimLogEntry, type LogFilters, type LogPeriod, type LogType } from "../lib/logquery.js";
 import { baseDomain, hostOf, normalizeUrl } from "../lib/urlmatch.js";
@@ -75,6 +77,10 @@ async function identitiesForUrl(target: FirewallTarget, url: string, time: Pick<
   }
   return [...seen.values()].sort((a, b) => b.count - a.count);
 }
+
+const FIX_NOTE =
+  "Suggestions ranked from the smallest change on existing config to a new rule. Present them as options, with their impact; " +
+  "check each rule's purpose and owner before editing it. Group memberships come from AD when available (otherwise only the user's own identity is matched).";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -285,7 +291,7 @@ export function registerDiagnoseTools(server: McpServer) {
       const loggedCategories = [...new Set(logs.entries.flatMap((e) => (nodeText(e.url_category_list) || nodeText(e.category)).split(",")).map((c) => c.trim()).filter(Boolean))];
       const categories = [...new Set([...analysis.effectiveCategories, ...loggedCategories])];
       const usage = await categoryUsage(target, categories, scope);
-      const membership = user ? await adMembership(user).catch(() => undefined) : undefined;
+      const membership = user ? await userMembership(user).catch(() => undefined) : undefined;
       findings.push(...urlFindings(analysis, usage, scope, membership));
 
       const loggedCustom = loggedCategories.filter((c) => /[A-Z ]/.test(c) && !analysis.covering.some((x) => x.category === c));
@@ -326,6 +332,16 @@ export function registerDiagnoseTools(server: McpServer) {
       }
       findings.push("If this URL is allowed but the site still fails, run diagnose_user_blocks with reported_url: the site may depend on other domains.");
 
+      const identity = logUser ?? (latest ? nodeText(latest.srcuser) : undefined);
+      const fixMembership: Membership | undefined = membership ?? (identity ? { identities: [identity], groups: [] } : undefined);
+      const fixOptions = suggestUrlFixes(host, [...analysis.covering.map((c) => c.category), ...loggedCustom], {
+        rules: usage.allRules,
+        locations: scope.locations,
+        blocking: blockingRule,
+        membership: fixMembership,
+        userLabel: user ?? identity ?? "the user",
+      });
+
       return jsonResponse({
         url,
         firewall_used: scope.deviceDescription,
@@ -337,6 +353,8 @@ export function registerDiagnoseTools(server: McpServer) {
         usage: summarizeUsage(usage),
         blocking_rule: blockingRule ? compactRule(blockingRule) : undefined,
         existing_exception_rules: exceptions.map(compactRule),
+        fix_options: fixOptions,
+        fix_options_note: FIX_NOTE,
         recent_url_logs: summarizeLogs("url", logs.entries, 10),
       });
     }
@@ -589,7 +607,9 @@ export function registerDiagnoseTools(server: McpServer) {
         }
         const allowing = relevant.filter((r) => r.action === "allow" && r.application.some((a) => names.has(a)));
         if (!allowing.length) findings.push(`No enabled rule in scope explicitly allows '${application}' (directly or via a group/filter).`);
-        const membership = user ? await adMembership(user).catch(() => undefined) : undefined;
+        const identity = user ?? (Array.isArray(out.user_id_mapping) ? (out.user_id_mapping as Array<{ user: string }>)[0]?.user : undefined);
+        const membership: Membership | undefined =
+          (identity ? await userMembership(identity).catch(() => undefined) : undefined) ?? (identity ? { identities: [identity], groups: [] } : undefined);
         for (const r of allowing.slice(0, 5)) {
           if (r.sourceUser.length && !r.sourceUser.includes("any")) {
             findings.push(`Allow rule '${r.name}' ${describeUserRestriction(r.sourceUser, membership)}.`);
@@ -601,6 +621,14 @@ export function registerDiagnoseTools(server: McpServer) {
         const pattern = exceptionPattern(exceptions);
         if (pattern) findings.push(pattern);
         if (denying[0]) findings.push(`An exception must be placed before '${denying[0].name}' in ${denying[0].location}/${denying[0].rulebase}.`);
+        out.fix_options = suggestAppFixes(application, {
+          rules: rules.filter((r) => ruleAppliesToDevice(r, serial)),
+          locations,
+          blocking: denying[0],
+          membership,
+          userLabel: user ?? identity ?? "the user",
+        });
+        out.fix_options_note = FIX_NOTE;
       }
 
       const logs = await gatherLogs(target, [

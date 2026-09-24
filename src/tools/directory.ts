@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { adLookupEnabled, adLookupUser, adMembership } from "../api/ad.js";
+import { adLookupEnabled, adLookupUser, userMembership } from "../api/ad.js";
+import { entraGroups, entraLookupEnabled } from "../api/entra.js";
 import { jsonResponse } from "../api/panorama.js";
 import { panoramaTarget } from "../api/ops.js";
 import { compactRule, fetchRules, sortByEvaluationOrder } from "../api/policy.js";
@@ -11,10 +12,25 @@ import { deviceGroupFilter } from "../schemas/debug.js";
 import { READ_ONLY } from "./debug.js";
 
 export function registerDirectoryTools(server: McpServer) {
-  // Needs Windows ADSI and a domain session: hidden elsewhere so the model does not try it.
-  if (!adLookupEnabled()) return;
+  const ad = adLookupEnabled();
+  const entra = entraLookupEnabled();
+  if (!ad && !entra) return;
 
-  server.tool(
+  if (entra) {
+    server.tool(
+      "entra_user_groups",
+      "[READ-ONLY] Entra ID (Azure AD) groups of a user, transitive and cloud-only included, via the Azure CLI session of this machine (az ad user get-member-groups). Rules may reference these groups through the Cloud Identity Engine (CN=...,DC=tenant,DC=onmicrosoft,DC=com).",
+      { user: z.string().min(3).max(256).describe("UPN/email or Entra object ID") },
+      { title: "Entra User Groups", ...READ_ONLY },
+      async ({ user }) => {
+        const groups = await entraGroups(user);
+        return jsonResponse({ user, count: groups.length, groups: groups.sort() });
+      }
+    );
+  }
+
+  // ad_lookup_user needs Windows ADSI and a domain session: hidden elsewhere so the model does not try it.
+  if (ad) server.tool(
     "ad_lookup_user",
     "[READ-ONLY] Looks a user up in Active Directory (email, UPN, DOMAIN\\id, account name or 'First Last'): account name, UPN, mail, department, disabled flag, AD groups, and the identities under which the user appears in PAN-OS logs (DOMAIN\\id for Citrix/AD, UPN for GlobalProtect/Prisma). Use it to turn a ticket's name/email into log identities and to check group-based rules.",
     {
@@ -34,7 +50,7 @@ export function registerDirectoryTools(server: McpServer) {
 
   server.tool(
     "ad_user_rules",
-    "[READ-ONLY] Which security/decryption rules target this user explicitly or through one of their AD groups (nested groups included), and, with 'contains' (app, category, rule name...), which relevant rules are restricted to OTHER users/groups with the group the user would need. Use it for 'the user should be allowed by the rule for group X'.",
+    "[READ-ONLY] Which security/decryption rules target this user explicitly or through one of their groups (on-prem AD with nested groups, and Entra ID groups via Azure CLI when available), and, with 'contains' (app, category, rule name...), which relevant rules are restricted to OTHER users/groups with the group the user would need. Use it for 'the user should be allowed by the rule for group X'.",
     {
       user: z.string().min(2).max(256).describe("Email, UPN, DOMAIN\\id or display name"),
       contains: z.string().max(127).optional().describe("Only rules mentioning this (application, URL category, rule name, tag...)"),
@@ -44,8 +60,8 @@ export function registerDirectoryTools(server: McpServer) {
     },
     { title: "AD User Rules", ...READ_ONLY },
     async ({ user, contains, device_group, policy, firewall }) => {
-      const membership = await adMembership(user);
-      if (!membership) throw new Error(`'${user}' not found in AD or ambiguous: use ad_lookup_user to pick the right account.`);
+      const membership = await userMembership(user);
+      if (!membership) throw new Error(`'${user}' not found in AD/Entra or ambiguous: use ad_lookup_user or entra_user_groups.`);
       const target = panoramaTarget(firewall);
 
       let scope = await resolveScope(target, undefined, device_group, { user: membership.identities[0] });
@@ -74,12 +90,18 @@ export function registerDirectoryTools(server: McpServer) {
       }
 
       return jsonResponse({
-        user: { displayName: membership.user.displayName, identities: membership.identities, group_count: membership.groups.length },
+        user: {
+          displayName: membership.displayName,
+          identities: membership.identities,
+          group_count: membership.groups.length,
+          group_sources: membership.sources,
+          ...(membership.warnings.length ? { warnings: membership.warnings } : {}),
+        },
         scope: scope.locations,
         ...(scope.note ? { note: scope.note } : {}),
         rules_targeting_user: targeting.slice(0, 40),
         ...(needle ? { relevant_rules_for_other_users: otherUsers.slice(0, 40) } : {}),
-        caveat: "Group names are matched by CN across formats (on-prem DN, Entra DN, domain\\group). Cloud-only groups (Cloud Identity Engine) are not visible in on-prem AD.",
+        caveat: "Group names are matched by name across formats (on-prem DN, Entra DN, domain\\group, Entra display name). If a group source is missing (see group_sources/warnings), some memberships may be unknown.",
       });
     }
   );
