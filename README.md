@@ -141,6 +141,21 @@ When multiple entries are configured, every tool accepts a `firewall: <name>` pa
 
 > **Linux headless servers:** If no keychain daemon is available (e.g. servers without `libsecret`), API keys fall back to plaintext in `firewalls.json` with a warning. Restrict the file with `chmod 600 ~/.config/panos-mcp/firewalls.json` in that case.
 
+## Organization notes
+
+Conventions that the configuration does not show (which device group serves which traffic, where exception rules go, which AD group is which team) can be written in a local Markdown file, kept outside the repository:
+
+```
+~/.config/panorama-mcp/org-notes.md
+```
+
+Override the path with `PANOS_ORG_NOTES=/custom/path.md`. The notes are appended to the server instructions, `start_ticket_diagnosis`, the playbook and the `diagnose_ticket` prompt. They are re-read on every call (server instructions only at startup). Example:
+
+```markdown
+- DG-Users-Rules: traffic of regular users. DG-VDI-Rules: traffic from VDI sessions.
+  Put a user's exception in the device group matching where they connect from.
+```
+
 ## Tool Categories
 
 | Category | Tools | Description |

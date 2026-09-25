@@ -32,30 +32,55 @@ import { baseDomain, hostOf, normalizeUrl } from "../lib/urlmatch.js";
 import { firewallName } from "../schemas/panos.js";
 import { deviceGroupFilter, ipAddress, logPeriod, managedDevice, port, urlInput, userName } from "../schemas/debug.js";
 import { PLAYBOOK, SERVER_INSTRUCTIONS, TICKET_METHOD } from "../playbook.js";
+import { withOrgNotes } from "../config/orgnotes.js";
 import { READ_ONLY } from "./debug.js";
+import {
+  DEFAULT_LOOKBACK_DAYS,
+  MAX_LOOKBACK_DAYS,
+  formatLogTime,
+  lookbackFinding,
+  lookbackWindows,
+  searchBackwards,
+  windowFilters,
+  type TimeWindow,
+} from "../lib/lookback.js";
 
 const panoramaEntry = firewallName.describe("Panorama entry from firewalls.json. Optional when a single Panorama is configured.");
 const incidentTime = z
   .string()
-  .regex(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}(:\d{2})?$/, "format 'YYYY/MM/DD HH:MM[:SS]'")
+  .regex(/^\d{4}\/\d{2}\/\d{2}( \d{2}:\d{2}(:\d{2})?)?$/, "format 'YYYY/MM/DD[ HH:MM[:SS]]'")
   .optional()
-  .describe("When the issue happened, 'YYYY/MM/DD HH:MM' in Panorama's timezone. Searches +/-30 minutes around it instead of 'period'.");
+  .describe(
+    "When the issue happened (NOT when the ticket was opened), in Panorama's timezone. 'YYYY/MM/DD HH:MM' searches +/-30 minutes around it; 'YYYY/MM/DD' searches that whole day. Omit it when unknown: logs are then searched back over several days."
+  );
+const lookbackDays = z
+  .number()
+  .int()
+  .min(1)
+  .max(MAX_LOOKBACK_DAYS)
+  .optional()
+  .describe(
+    `Used when neither incident_time nor period is given: logs are searched back window by window (last 24h, then 1-2, 2-3, 3-5, 5-7... days ago) until evidence is found, because users often open the ticket days after being blocked. Default ${DEFAULT_LOOKBACK_DAYS}, max ${MAX_LOOKBACK_DAYS}.`
+  );
 
-function formatLogTime(ms: number): string {
-  const d = new Date(ms);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-/** Time filters: +/-30 min around the incident when known, else the relative period. */
-function timeWindow(incident?: string, period?: LogPeriod): { filters: Pick<LogFilters, "period" | "start_time" | "end_time">; incidentMs?: number } {
+/**
+ * Windows to search: +/-30 min around the incident time, its whole day for a date only, the explicit period,
+ * or otherwise backward windows over the last lookback_days days.
+ */
+function timeWindows(incident?: string, period?: LogPeriod, lookback?: number): { windows: TimeWindow[]; incidentMs?: number; backward: boolean } {
   if (incident) {
-    const ms = logTime(incident.length === 16 ? `${incident}:00` : incident);
-    if (!Number.isNaN(ms)) {
-      return { filters: { start_time: formatLogTime(ms - 30 * 60_000), end_time: formatLogTime(ms + 30 * 60_000) }, incidentMs: ms };
+    if (incident.length === 10) {
+      const start = logTime(`${incident} 00:00:00`);
+      if (!Number.isNaN(start)) return { windows: [{ start_time: formatLogTime(start), end_time: `${incident} 23:59:59`, label: incident }], backward: false };
+    } else {
+      const ms = logTime(incident.length === 16 ? `${incident}:00` : incident);
+      if (!Number.isNaN(ms)) {
+        return { windows: [{ start_time: formatLogTime(ms - 30 * 60_000), end_time: formatLogTime(ms + 30 * 60_000), label: "incident +/-30 min" }], incidentMs: ms, backward: false };
+      }
     }
   }
-  return { filters: { period: period ?? "last-24-hrs" } };
+  if (period) return { windows: [{ period, label: period }], backward: false };
+  return { windows: lookbackWindows(Date.now(), lookback), backward: true };
 }
 
 function isFullIdentity(user?: string): boolean {
@@ -136,13 +161,14 @@ export function registerDiagnoseTools(server: McpServer) {
       blocked_url: urlInput.optional().describe("URL shown on the block page / screenshot, if any"),
       incident_time: incidentTime,
       period: logPeriod,
+      lookback_days: lookbackDays,
       max_groups: z.number().int().min(1).max(100).optional().describe("Default 25"),
       firewall: panoramaEntry,
     },
     { title: "Diagnose User Blocks", ...READ_ONLY },
-    async ({ user, src_ip, reported_url, blocked_url, incident_time, period, max_groups, firewall }) => {
+    async ({ user, src_ip, reported_url, blocked_url, incident_time, period, lookback_days, max_groups, firewall }) => {
       const target = panoramaTarget(firewall);
-      const { filters: time, incidentMs } = timeWindow(incident_time, period);
+      const { windows, incidentMs, backward } = timeWindows(incident_time, period, lookback_days);
       const findings: string[] = [];
 
       // Identities under which the user may be logged: AD gives both DOMAIN\\id (Citrix/AD) and UPN (GlobalProtect).
@@ -178,15 +204,19 @@ export function registerDiagnoseTools(server: McpServer) {
             "Provide src_ip, the exact logged identity (name@domain or DOMAIN\\id), or blocked_url/reported_url to discover who accessed it."
           );
         }
-        const seen = await identitiesForUrl(target, probe, time);
         const hint = user?.toLowerCase();
-        const candidates = hint ? seen.filter((i) => i.user.toLowerCase().includes(hint)) : seen;
+        const matching = (seen: Awaited<ReturnType<typeof identitiesForUrl>>) => (hint ? seen.filter((i) => i.user.toLowerCase().includes(hint)) : seen);
+        const lb = await searchBackwards(windows, (w) => identitiesForUrl(target, probe, windowFilters(w)), (seen) => matching(seen).length > 0);
+        const seen = lb.result;
+        const candidates = matching(seen);
+        // The user reached the URL in that window at the latest: newer windows cannot hold the block.
+        if (lb.found) windows.splice(0, windows.indexOf(lb.found));
         if (candidates.length !== 1) {
           return jsonResponse({
             need_identity: true,
             message:
               candidates.length === 0
-                ? `No identity matching '${user ?? ""}' accessed ${hostOf(normalizeUrl(probe))} in this window. Citrix users appear as DOMAIN\\id: ask for the user's ID, or use the source IP.`
+                ? `No identity matching '${user ?? ""}' accessed ${hostOf(normalizeUrl(probe))} since ${lb.searched[lb.searched.length - 1].start_time ?? lb.searched[0].label}. Citrix users appear as DOMAIN\\id: ask for the user's ID, or use the source IP; if the block is older, ask when it happened.`
                 : "Several identities accessed this URL: re-run with the right one as 'user' (or its src_ip).",
             identities_seen_for_url: seen.slice(0, 20),
           });
@@ -195,37 +225,53 @@ export function registerDiagnoseTools(server: McpServer) {
         findings.push(`Identity resolved from URL logs: '${identities[0]}' (sources ${candidates[0].sources.join(", ")}).`);
       }
 
-      // One search set per identity (or a single one by source IP).
-      const whos: LogFilters[] = src_ip ? [{ src_ip, ...time }] : identities.slice(0, 3).map((id) => ({ user: id, ...time }));
-      const searches: Parameters<typeof gatherLogs>[1] = whos.flatMap((who) => [
-        { type: "traffic" as const, filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "threat" as const, filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "url" as const, filters: { ...who, only_blocked: true }, max: 200 },
-        { type: "data" as const, filters: { ...who, only_blocked: true }, max: 50 },
-        { type: "wildfire" as const, filters: who, max: 50, keep: (e: Record<string, any>) => !/benign/i.test(nodeText(e.category)) },
-        { type: "decryption" as const, filters: who, max: 100, keep: (e: Record<string, any>) => Boolean(nodeText(e.error) || nodeText(e.error_index)) },
-      ]);
-      const upn = identities.find((i) => i.includes("@"));
-      if (upn) searches.push({ type: "globalprotect", filters: { user: upn, ...time }, max: 50, keep: (e) => /fail/i.test(nodeText(e.status)) });
-
-      // Moments when the user reached the reported site (alert/block categories are logged).
       const reportedHost = reported_url ? hostOf(normalizeUrl(reported_url)) : undefined;
-      const anchorSearch = reportedHost
-        ? gatherLogs(target, whos.map((who) => ({ type: "url" as const, filters: { ...who, url_contains: baseDomain(reportedHost) }, max: 100 })))
-        : Promise.resolve({ events: [] as LogEvent[], counts: {}, errors: {} });
+      const blockedHost = blocked_url ? hostOf(normalizeUrl(blocked_url)) : undefined;
 
-      const [{ events, counts, errors }, anchors] = await Promise.all([gatherLogs(target, searches), anchorSearch]);
+      /** Every log type for the user in one window, grouped and related to the reported site. */
+      const searchWindow = async (w: TimeWindow) => {
+        const time = windowFilters(w);
+        // One search set per identity (or a single one by source IP).
+        const whos: LogFilters[] = src_ip ? [{ src_ip, ...time }] : identities.slice(0, 3).map((id) => ({ user: id, ...time }));
+        const searches: Parameters<typeof gatherLogs>[1] = whos.flatMap((who) => [
+          { type: "traffic" as const, filters: { ...who, only_blocked: true }, max: 200 },
+          { type: "threat" as const, filters: { ...who, only_blocked: true }, max: 200 },
+          { type: "url" as const, filters: { ...who, only_blocked: true }, max: 200 },
+          { type: "data" as const, filters: { ...who, only_blocked: true }, max: 50 },
+          { type: "wildfire" as const, filters: who, max: 50, keep: (e: Record<string, any>) => !/benign/i.test(nodeText(e.category)) },
+          { type: "decryption" as const, filters: who, max: 100, keep: (e: Record<string, any>) => Boolean(nodeText(e.error) || nodeText(e.error_index)) },
+        ]);
+        const upn = identities.find((i) => i.includes("@"));
+        if (upn) searches.push({ type: "globalprotect", filters: { user: upn, ...time }, max: 50, keep: (e) => /fail/i.test(nodeText(e.status)) });
 
-      const groups = groupEvents(
-        events,
-        (t, e) => trimLogEntry(t, e),
-        reported_url ? { url: reported_url, incidentTime: incidentMs } : undefined,
-        anchors.events
-      ).filter((g) => g.blocked || g.layer !== "none");
+        // Moments when the user reached the reported site (alert/block categories are logged).
+        const anchorSearch = reportedHost
+          ? gatherLogs(target, whos.map((who) => ({ type: "url" as const, filters: { ...who, url_contains: baseDomain(reportedHost) }, max: 100 })))
+          : Promise.resolve({ events: [] as LogEvent[], counts: {}, errors: {} });
+
+        const [{ events, counts, errors }, anchors] = await Promise.all([gatherLogs(target, searches), anchorSearch]);
+        const groups = groupEvents(
+          events,
+          (t, e) => trimLogEntry(t, e),
+          reported_url ? { url: reported_url, incidentTime: incidentMs } : undefined,
+          anchors.events
+        ).filter((g) => g.blocked || g.layer !== "none");
+        return { time, events, counts, errors, groups };
+      };
+
+      // Relevant evidence: the block page URL, else blocks around the reported site, else any block.
+      const relevant = ({ groups }: Awaited<ReturnType<typeof searchWindow>>) =>
+        blockedHost
+          ? groups.some((g) => g.blocked && baseDomain(g.destination) === baseDomain(blockedHost))
+          : reportedHost
+            ? groups.some((g) => g.blocked && g.relation !== undefined)
+            : groups.some((g) => g.blocked);
+      const lb = await searchBackwards(windows, searchWindow, relevant);
+      const { time, events, counts, errors, groups } = lb.result;
+      if (backward) findings.push(lookbackFinding(lb, blockedHost ? `a block on ${blockedHost}` : reportedHost ? `a block related to ${reportedHost}` : "a block"));
 
       findings.push(...reportedSiteFindings(groups, reported_url));
-      if (blocked_url) {
-        const blockedHost = hostOf(normalizeUrl(blocked_url));
+      if (blockedHost) {
         const hit = groups.find((g) => g.destination === blockedHost);
         findings.push(
           hit
@@ -241,7 +287,13 @@ export function registerDiagnoseTools(server: McpServer) {
       const devices = [...new Set(events.map((e) => nodeText(e.entry.device_name)).filter(Boolean))];
 
       return jsonResponse({
-        searched: { identities: src_ip ? undefined : identities, src_ip, ...time, matches_per_log_type: counts },
+        searched: {
+          identities: src_ip ? undefined : identities,
+          src_ip,
+          ...time,
+          ...(backward ? { windows_searched: lb.searched.map((w) => w.label) } : {}),
+          matches_per_log_type: counts,
+        },
         ...(adUser ? { ad_user: adUser } : {}),
         devices_seen: devices,
         findings,
@@ -263,23 +315,28 @@ export function registerDiagnoseTools(server: McpServer) {
       device: managedDevice.optional().describe("Specific firewall; usually omit it."),
       incident_time: incidentTime,
       period: logPeriod,
+      lookback_days: lookbackDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose URL Access", ...READ_ONLY },
-    async ({ url, device, device_group, user, src_ip, incident_time, period, firewall }) => {
+    async ({ url, device, device_group, user, src_ip, incident_time, period, lookback_days, firewall }) => {
       const target = panoramaTarget(firewall);
       const host = hostOf(normalizeUrl(url));
-      const { filters: time } = timeWindow(incident_time, period);
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
       const findings: string[] = [];
       const logUser = isFullIdentity(user) ? user : undefined;
       if (user && !logUser) findings.push(`'${user}' is not a complete logged identity: URL logs were searched for all users (see users in recent_url_logs).`);
 
-      const logs = await searchLogs(target, "url", { user: src_ip ? undefined : logUser, src_ip, url_contains: host, ...time }, 200).catch((err) => ({
-        query: "",
-        entries: [] as Record<string, any>[],
-        matched: 0,
-        error: errMsg(err),
-      }));
+      const searchWindow = (w: TimeWindow) =>
+        searchLogs(target, "url", { user: src_ip ? undefined : logUser, src_ip, url_contains: host, ...windowFilters(w) }, 200).catch((err) => ({
+          query: "",
+          entries: [] as Record<string, any>[],
+          matched: 0,
+          error: errMsg(err),
+        }));
+      const lb = await searchBackwards(windows, searchWindow, (res) => res.entries.some((e) => isBlockingAction("url", nodeText(e.action))));
+      const logs = lb.result;
+      if (backward) findings.push(lookbackFinding(lb, `a blocked URL log for ${host}`));
       const blockedLogs = logs.entries.filter((e) => isBlockingAction("url", nodeText(e.action)));
       const latest = blockedLogs[0] ?? logs.entries[0];
 
@@ -371,23 +428,31 @@ export function registerDiagnoseTools(server: McpServer) {
       filename: z.string().max(255).regex(/^[^'"<>]+$/).optional().describe("File name (substring)"),
       incident_time: incidentTime,
       period: logPeriod,
+      lookback_days: lookbackDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose Threat/File Block", ...READ_ONLY },
-    async ({ user, src_ip, threat_id, file_hash, filename, incident_time, period, firewall }) => {
+    async ({ user, src_ip, threat_id, file_hash, filename, incident_time, period, lookback_days, firewall }) => {
       if (!user && !src_ip && !threat_id && !file_hash && !filename) throw new Error("Provide at least one of user, src_ip, threat_id, file_hash, filename");
       const target = panoramaTarget(firewall);
-      const { filters: time } = timeWindow(incident_time, period);
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
       const hash = file_hash?.toLowerCase();
       const keep = (e: Record<string, any>) =>
         (!threat_id || threatNumber(nodeText(e.threatid)) === threat_id) &&
         (!hash || nodeText(e.filedigest).toLowerCase() === hash) &&
         (!filename || nodeText(e.misc).toLowerCase().includes(filename.toLowerCase()));
 
-      const { events, errors } = await gatherLogs(target, [
-        { type: "threat", filters: { user, src_ip, ...time }, max: 100, keep },
-        { type: "wildfire", filters: { user, src_ip, ...time }, max: 20, keep },
-      ]);
+      const lb = await searchBackwards(
+        windows,
+        (w) =>
+          gatherLogs(target, [
+            { type: "threat", filters: { user, src_ip, ...windowFilters(w) }, max: 100, keep },
+            { type: "wildfire", filters: { user, src_ip, ...windowFilters(w) }, max: 20, keep },
+          ]),
+        (res) => res.events.some((e) => e.logType === "threat")
+      );
+      const { events, errors } = lb.result;
+      const lookbackNote = backward ? [lookbackFinding(lb, "a matching threat log")] : [];
       const threats = events.filter((e) => e.logType === "threat");
       const verdicts = events
         .filter((e) => e.logType === "wildfire")
@@ -395,7 +460,7 @@ export function registerDiagnoseTools(server: McpServer) {
 
       if (!threats.length) {
         return jsonResponse({
-          findings: ["No matching threat log found.", ...NO_LOG_HINTS],
+          findings: [...lookbackNote, "No matching threat log found.", ...NO_LOG_HINTS],
           wildfire_verdicts: verdicts,
           ...(Object.keys(errors).length ? { errors } : {}),
         });
@@ -495,6 +560,7 @@ export function registerDiagnoseTools(server: McpServer) {
 
       const malicious = verdicts.filter((v) => v.verdict && !/benign/i.test(v.verdict));
       return jsonResponse({
+        ...(lookbackNote.length ? { findings: lookbackNote } : {}),
         analyses,
         wildfire_verdicts: verdicts,
         ...(malicious.length ? { note: "WildFire verdicts other than benign: if believed wrong, request a verdict change from Palo Alto (WildFire portal) with the SHA-256." } : {}),
@@ -515,23 +581,29 @@ export function registerDiagnoseTools(server: McpServer) {
       application: z.string().max(63).optional().describe("App-ID seen in logs, e.g. 'adobe-podcast' or 'box-uploading'"),
       device_group: deviceGroupFilter,
       device: managedDevice.optional().describe("Specific firewall; usually omit it (inferred from the source's traffic or device_group)."),
+      incident_time: incidentTime,
       period: logPeriod,
+      lookback_days: lookbackDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose Flow", ...READ_ONLY },
-    async ({ device, device_group, destination, destination_port, protocol, src_ip, user, application, period, firewall }) => {
+    async ({ device, device_group, destination, destination_port, protocol, src_ip, user, application, incident_time, period, lookback_days, firewall }) => {
       if (!src_ip && !user) throw new Error("Provide 'src_ip' and/or 'user'");
       const target = panoramaTarget(firewall);
       const findings: string[] = [];
       const out: Record<string, unknown> = {};
-      const time = { period: period ?? ("last-24-hrs" as LogPeriod) };
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
 
       if (!src_ip && user) {
-        const recent = await searchLogs(target, "traffic", { user: assertFullIdentity(user), ...time }, 200);
+        const identity = assertFullIdentity(user);
+        const found = await searchBackwards(windows, (w) => searchLogs(target, "traffic", { user: identity, ...windowFilters(w) }, 200), (res) => res.entries.length > 0);
+        const recent = found.result;
         const counts = new Map<string, number>();
         for (const e of recent.entries) counts.set(nodeText(e.src), (counts.get(nodeText(e.src)) ?? 0) + 1);
         src_ip = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-        if (!src_ip) throw new Error(`No traffic log for user '${user}' in ${time.period}: provide src_ip`);
+        if (!src_ip) throw new Error(`No traffic log for user '${user}' since ${found.searched[found.searched.length - 1].start_time ?? found.searched[0].label}: provide src_ip`);
+        // The user had no traffic in the newer windows: the flow cannot be there.
+        if (found.found) windows.splice(0, windows.indexOf(found.found));
         findings.push(`Source IP inferred from traffic logs: ${src_ip}${counts.size > 1 ? ` (other IPs seen: ${[...counts.keys()].filter((k) => k !== src_ip).join(", ")})` : ""}.`);
       }
 
@@ -631,11 +703,20 @@ export function registerDiagnoseTools(server: McpServer) {
         out.fix_options_note = FIX_NOTE;
       }
 
-      const logs = await gatherLogs(target, [
-        { type: "traffic", filters: { src_ip, dst_ip: destination, dst_port: destination_port, ...time }, max: 50 },
-        { type: "threat", filters: { src_ip, dst_ip: destination, only_blocked: true, ...time }, max: 20 },
-      ]);
-      const groups = groupEvents(logs.events, (t, e) => trimLogEntry(t, e));
+      const lb = await searchBackwards(
+        windows,
+        async (w) => {
+          const time = windowFilters(w);
+          const logs = await gatherLogs(target, [
+            { type: "traffic", filters: { src_ip, dst_ip: destination, dst_port: destination_port, ...time }, max: 50 },
+            { type: "threat", filters: { src_ip, dst_ip: destination, only_blocked: true, ...time }, max: 20 },
+          ]);
+          return { logs, groups: groupEvents(logs.events, (t, e) => trimLogEntry(t, e)) };
+        },
+        ({ groups }) => groups.some((g) => g.blocked)
+      );
+      const { logs, groups } = lb.result;
+      if (backward) findings.push(lookbackFinding(lb, "a blocked log for this flow"));
       out.log_groups = groups.slice(0, 15);
       if (!groups.length) findings.push(...NO_LOG_HINTS);
       for (const g of groups.filter((g) => g.blocked || g.layer !== "none").slice(0, 5)) findings.push(`Logs: ${g.summary} (x${g.count}, last ${g.last_seen}).`);
@@ -650,7 +731,7 @@ export function registerDiagnoseTools(server: McpServer) {
     "[READ-ONLY] Call this FIRST when the user shares a support ticket or asks to debug a blocked user: returns the diagnosis method, the rules to follow and the expected answer format.",
     {},
     { title: "Start Ticket Diagnosis", ...READ_ONLY },
-    async () => ({ content: [{ type: "text" as const, text: `${SERVER_INSTRUCTIONS}\n\n${TICKET_METHOD}` }] })
+    async () => ({ content: [{ type: "text" as const, text: withOrgNotes(`${SERVER_INSTRUCTIONS}\n\n${TICKET_METHOD}`) }] })
   );
 
   server.tool(
@@ -658,14 +739,14 @@ export function registerDiagnoseTools(server: McpServer) {
     "[READ-ONLY] Returns the troubleshooting playbook: visibility pitfalls, third-party dependencies, URL filtering, file/threat false positives, App-ID, User-ID, NAT, decryption, DNS security, EDL, zone protection. Read it when the cause is unclear or before concluding.",
     {},
     { title: "Troubleshooting Playbook", ...READ_ONLY },
-    async () => ({ content: [{ type: "text" as const, text: PLAYBOOK }] })
+    async () => ({ content: [{ type: "text" as const, text: withOrgNotes(PLAYBOOK) }] })
   );
 
   server.resource(
     "troubleshooting-playbook",
     "panorama://playbook",
     { mimeType: "text/markdown", description: "Troubleshooting playbook for Panorama-managed firewalls" },
-    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: PLAYBOOK }] })
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: withOrgNotes(PLAYBOOK) }] })
   );
 
   server.prompt(
@@ -678,7 +759,7 @@ export function registerDiagnoseTools(server: McpServer) {
           role: "user",
           content: {
             type: "text",
-            text: `Here is a support ticket excerpt:\n\n<ticket>\n${ticket}\n</ticket>\n\nDiagnose it with the Panorama tools.\n\n${TICKET_METHOD}`,
+            text: `Here is a support ticket excerpt:\n\n<ticket>\n${ticket}\n</ticket>\n\nDiagnose it with the Panorama tools.\n\n${withOrgNotes(TICKET_METHOD)}`,
           },
         },
       ],

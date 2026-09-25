@@ -19,13 +19,13 @@ Rules:
 - No log does not mean no block: see the visibility pitfalls in the playbook (resource panorama://playbook).
 - Evidence must belong to the ticket's user. If you use logs of other users (found by URL or application), say so explicitly and confirm the user's identity or IP.
 - Before naming a profile group, profile, category, application, schedule or tag in a proposal, check that it exists (find_objects / resolve_application). Base new exception rules on the existing ones returned as existing_exception_rules (same device group, position before the enforcing rule, same profile group, schedule and naming convention, ticket number in description).
-- Keep log windows short: use incident_time (+/-30 min) or last-24-hrs. 30-day searches time out.
+- The ticket date is not the incident date: users often open a ticket days after being blocked. Pass incident_time only when the ticket says when it happened ('YYYY/MM/DD HH:MM', or 'YYYY/MM/DD' for a whole day). Otherwise omit it and 'period': diagnose tools then search back window by window (last 24h, 1-2, 2-3, 3-5, 5-7 days ago; lookback_days up to 14) and stop where the evidence is. Do not conclude 'no block' from the last 24h only. Avoid a single 30-day search: it times out.
 - This server is read-only: describe changes for a human to apply in Panorama, then commit and push.
 - Consult the playbook resource for less common cases.`;
 
 /** Method and answer format for a ticket; exposed as a tool because not every MCP client supports prompts. */
 export const TICKET_METHOD = `Ticket diagnosis method:
-1. List the facts from the ticket: user (email or name; ad_lookup_user gives the logged identities and AD groups), IP, requested site/URL, block page URL and category if a screenshot is described, action attempted (browse, upload, download, app), time, location (office, Citrix, GlobalProtect). Say which ones are missing.
+1. List the facts from the ticket: user (email or name; ad_lookup_user gives the logged identities and AD groups), IP, requested site/URL, block page URL and category if a screenshot is described, action attempted (browse, upload, download, app), time of the block (distinct from the ticket's opening date), location (office, Citrix, GlobalProtect). Say which ones are missing.
 2. Run diagnose_user_blocks with what you have: user and/or src_ip, reported_url, blocked_url, incident_time. If it returns need_identity, pick the identity or ask the human.
 3. Drill down on the blocking layer: diagnose_url_access (URL filtering), diagnose_threat_block (files, signatures), diagnose_flow (policy deny, App-ID, apps like GenAI). Use resolve_application and find_objects to check names. Read get_troubleshooting_playbook if the cause is unclear.
 4. Answer in the ticket's language with these sections: Summary / Evidence (quote logs and rules, say whose logs they are) / Root cause (confidence level) / Recommended fix (minimal; extend an existing exception rule or copy its pattern; only objects verified to exist; device group and position) / Risk / What to ask the user if data is missing.

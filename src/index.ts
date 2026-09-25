@@ -27,6 +27,7 @@ import { registerUrlCategoryTools } from "./tools/urlcategories.js";
 import { registerDiagnoseTools } from "./tools/diagnose.js";
 import { registerDirectoryTools } from "./tools/directory.js";
 import { SERVER_INSTRUCTIONS } from "./playbook.js";
+import { withOrgNotes } from "./config/orgnotes.js";
 import { isReadOnlyMode, selectedModules } from "./config/mode.js";
 
 const server = new McpServer(
@@ -34,7 +35,7 @@ const server = new McpServer(
     name: "panos-mcp",
     version: "1.3.30",
   },
-  { instructions: SERVER_INSTRUCTIONS }
+  { instructions: withOrgNotes(SERVER_INSTRUCTIONS) }
 );
 
 const readOnly = isReadOnlyMode();

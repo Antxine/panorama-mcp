@@ -122,7 +122,7 @@ export function registerDebugTools(server: McpServer) {
 
   server.tool(
     "search_logs",
-    "[READ-ONLY] Low-level log search (for a ticket, start with diagnose_user_blocks instead). Searches logs stored on Panorama (traffic, threat, url, wildfire, data, globalprotect, userid, auth, decryption, system). Returns a 'summary' grouping matching events (same destination/action/rule/category...) with counts, users and sources, plus a few raw 'entries' each explained in '_why'. 'user' must be the exact logged identity (name@domain or DOMAIN\\id); 'url_contains' only works on url logs. Keep the window short (incident_time in diagnose tools, or last-24-hrs): 30-day searches time out.",
+    "[READ-ONLY] Low-level log search (for a ticket, start with diagnose_user_blocks instead). Searches logs stored on Panorama (traffic, threat, url, wildfire, data, globalprotect, userid, auth, decryption, system). Returns a 'summary' grouping matching events (same destination/action/rule/category...) with counts, users and sources, plus a few raw 'entries' each explained in '_why'. 'user' must be the exact logged identity (name@domain or DOMAIN\\id); 'url_contains' only works on url logs. Keep each window short (start_time/end_time or last-24-hrs; the diagnose tools search back over several days automatically): 30-day searches time out.",
     {
       log_type: logType,
       src_ip: z.string().max(49).optional().describe("Source IP or CIDR"),
