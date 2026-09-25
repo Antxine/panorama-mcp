@@ -60,7 +60,7 @@ const lookbackDays = z
   .max(MAX_LOOKBACK_DAYS)
   .optional()
   .describe(
-    `Used when neither incident_time nor period is given: logs are searched back window by window (last 24h, then 1-2, 2-3, 3-5, 5-7... days ago) until evidence is found, because users often open the ticket days after being blocked. Default ${DEFAULT_LOOKBACK_DAYS}, max ${MAX_LOOKBACK_DAYS}.`
+    `Used when neither incident_time nor period is given: logs are searched back window by window (last 24h, then 1-2, 2-3, 3-5, 5-7, 7-10, 10-14... days ago) until evidence is found, because users often open the ticket days after being blocked. Default ${DEFAULT_LOOKBACK_DAYS}, max ${MAX_LOOKBACK_DAYS}.`
   );
 
 /**

@@ -8,11 +8,11 @@ import type { LogFilters, LogPeriod } from "./logquery.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Window boundaries in days before now: [0-1], [1-2], [2-3], [3-5], [5-7], [7-10], [10-14]. */
-const BOUNDARIES = [0, 1, 2, 3, 5, 7, 10, 14];
+/** Window boundaries in days before now: [0-1], [1-2], [2-3], [3-5], [5-7], [7-10], [10-14], [14-21], [21-30]. */
+const BOUNDARIES = [0, 1, 2, 3, 5, 7, 10, 14, 21, 30];
 
-export const DEFAULT_LOOKBACK_DAYS = 7;
-export const MAX_LOOKBACK_DAYS = 14;
+export const DEFAULT_LOOKBACK_DAYS = 14;
+export const MAX_LOOKBACK_DAYS = 30;
 
 export interface TimeWindow {
   start_time?: string;
