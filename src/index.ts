@@ -28,6 +28,8 @@ import { registerDiagnoseTools } from "./tools/diagnose.js";
 import { registerDirectoryTools } from "./tools/directory.js";
 import { SERVER_INSTRUCTIONS } from "./playbook.js";
 import { withOrgNotes } from "./config/orgnotes.js";
+import { runWithBudget } from "./lib/budget.js";
+import { clearConfigCache } from "./api/panorama.js";
 import { isReadOnlyMode, selectedModules } from "./config/mode.js";
 
 const server = new McpServer(
@@ -54,7 +56,14 @@ const _tool = server.tool.bind(server);
   }
   args[last] = async (...hArgs: any[]) => {
     try {
-      return await handler(...hArgs);
+      // The last argument is the request context, with the client's cancellation signal.
+      const signal: AbortSignal | undefined = hArgs[hArgs.length - 1]?.signal;
+      try {
+        return await runWithBudget(() => handler(...hArgs), signal);
+      } finally {
+        // A tool that may change the config invalidates the cached config reads.
+        if (annotations?.readOnlyHint !== true) clearConfigCache();
+      }
     } catch (error) {
       return {
         content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }],

@@ -138,18 +138,46 @@ async function withReadSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Config reads are cached (PANOS_CONFIG_CACHE_SECONDS, default 300; 0 disables): a ticket diagnosis
+ * reads the same rules and objects of dozens of device groups in several tool calls, and the running
+ * config only changes on commit. Concurrent reads of the same node share one request.
+ */
+function configCacheMs(): number {
+  const value = Number(process.env.PANOS_CONFIG_CACHE_SECONDS);
+  return (Number.isFinite(value) && value >= 0 ? value : 300) * 1000;
+}
+const configCache = new Map<string, { at: number; entries: Promise<any[]> }>();
+
+export function clearConfigCache(): void {
+  configCache.clear();
+}
+
 /** Reads `<location>/<relative>` from the running config and returns its `entry` list. */
 export async function readEntries(target: FirewallTarget, deviceGroup: string, relative: string): Promise<any[]> {
   const xpath = `${locationXpath(deviceGroup)}/${relative}`;
-  const result = await withReadSlot(() => showConfig(xpath, target));
-  if (!result.success) {
-    // An empty or missing node is reported as an error by some PAN-OS versions.
-    if (/No such node|not present/i.test(result.error ?? "")) return [];
-    throw new Error(result.error);
+  const key = `${target.host}|${xpath}`;
+  const ttl = configCacheMs();
+  const cached = configCache.get(key);
+  if (ttl && cached && Date.now() - cached.at < ttl) return cached.entries;
+
+  const entries = (async () => {
+    const result = await withReadSlot(() => showConfig(xpath, target));
+    if (!result.success) {
+      // An empty or missing node is reported as an error by some PAN-OS versions.
+      if (/No such node|not present/i.test(result.error ?? "")) return [];
+      throw new Error(result.error);
+    }
+    const leaf = relative.split("/").pop()!;
+    const node = result.data?.[leaf] ?? result.data;
+    return asArray(node?.entry);
+  })();
+  if (ttl) {
+    configCache.set(key, { at: Date.now(), entries });
+    // Errors are not cached.
+    entries.catch(() => configCache.delete(key));
   }
-  const leaf = relative.split("/").pop()!;
-  const node = result.data?.[leaf] ?? result.data;
-  return asArray(node?.entry);
+  return entries;
 }
 
 /** Above this size, MCP clients spill the output to a file and the model starts parsing it with shell scripts. */

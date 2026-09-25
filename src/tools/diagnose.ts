@@ -62,12 +62,19 @@ const lookbackDays = z
   .describe(
     `Used when neither incident_time nor period is given: logs are searched back window by window (last 24h, then 1-2, 2-3, 3-5, 5-7, 7-10, 10-14... days ago) until evidence is found, because users often open the ticket days after being blocked. Default ${DEFAULT_LOOKBACK_DAYS}, max ${MAX_LOOKBACK_DAYS}.`
   );
+const lookbackStartDays = z
+  .number()
+  .int()
+  .min(0)
+  .max(MAX_LOOKBACK_DAYS - 1)
+  .optional()
+  .describe("Resume a backward search that stopped early: start that many days ago (value given in the previous findings).");
 
 /**
  * Windows to search: +/-30 min around the incident time, its whole day for a date only, the explicit period,
  * or otherwise backward windows over the last lookback_days days.
  */
-function timeWindows(incident?: string, period?: LogPeriod, lookback?: number): { windows: TimeWindow[]; incidentMs?: number; backward: boolean } {
+function timeWindows(incident?: string, period?: LogPeriod, lookback?: number, lookbackStart?: number): { windows: TimeWindow[]; incidentMs?: number; backward: boolean } {
   if (incident) {
     if (incident.length === 10) {
       const start = logTime(`${incident} 00:00:00`);
@@ -80,7 +87,7 @@ function timeWindows(incident?: string, period?: LogPeriod, lookback?: number): 
     }
   }
   if (period) return { windows: [{ period, label: period }], backward: false };
-  return { windows: lookbackWindows(Date.now(), lookback), backward: true };
+  return { windows: lookbackWindows(Date.now(), lookback, lookbackStart), backward: true };
 }
 
 function isFullIdentity(user?: string): boolean {
@@ -162,13 +169,14 @@ export function registerDiagnoseTools(server: McpServer) {
       incident_time: incidentTime,
       period: logPeriod,
       lookback_days: lookbackDays,
+      lookback_start_days: lookbackStartDays,
       max_groups: z.number().int().min(1).max(100).optional().describe("Default 25"),
       firewall: panoramaEntry,
     },
     { title: "Diagnose User Blocks", ...READ_ONLY },
-    async ({ user, src_ip, reported_url, blocked_url, incident_time, period, lookback_days, max_groups, firewall }) => {
+    async ({ user, src_ip, reported_url, blocked_url, incident_time, period, lookback_days, lookback_start_days, max_groups, firewall }) => {
       const target = panoramaTarget(firewall);
-      const { windows, incidentMs, backward } = timeWindows(incident_time, period, lookback_days);
+      const { windows, incidentMs, backward } = timeWindows(incident_time, period, lookback_days, lookback_start_days);
       const findings: string[] = [];
 
       // Identities under which the user may be logged: AD gives both DOMAIN\\id (Citrix/AD) and UPN (GlobalProtect).
@@ -316,13 +324,14 @@ export function registerDiagnoseTools(server: McpServer) {
       incident_time: incidentTime,
       period: logPeriod,
       lookback_days: lookbackDays,
+      lookback_start_days: lookbackStartDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose URL Access", ...READ_ONLY },
-    async ({ url, device, device_group, user, src_ip, incident_time, period, lookback_days, firewall }) => {
+    async ({ url, device, device_group, user, src_ip, incident_time, period, lookback_days, lookback_start_days, firewall }) => {
       const target = panoramaTarget(firewall);
       const host = hostOf(normalizeUrl(url));
-      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days, lookback_start_days);
       const findings: string[] = [];
       const logUser = isFullIdentity(user) ? user : undefined;
       if (user && !logUser) findings.push(`'${user}' is not a complete logged identity: URL logs were searched for all users (see users in recent_url_logs).`);
@@ -429,13 +438,14 @@ export function registerDiagnoseTools(server: McpServer) {
       incident_time: incidentTime,
       period: logPeriod,
       lookback_days: lookbackDays,
+      lookback_start_days: lookbackStartDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose Threat/File Block", ...READ_ONLY },
-    async ({ user, src_ip, threat_id, file_hash, filename, incident_time, period, lookback_days, firewall }) => {
+    async ({ user, src_ip, threat_id, file_hash, filename, incident_time, period, lookback_days, lookback_start_days, firewall }) => {
       if (!user && !src_ip && !threat_id && !file_hash && !filename) throw new Error("Provide at least one of user, src_ip, threat_id, file_hash, filename");
       const target = panoramaTarget(firewall);
-      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days, lookback_start_days);
       const hash = file_hash?.toLowerCase();
       const keep = (e: Record<string, any>) =>
         (!threat_id || threatNumber(nodeText(e.threatid)) === threat_id) &&
@@ -584,15 +594,16 @@ export function registerDiagnoseTools(server: McpServer) {
       incident_time: incidentTime,
       period: logPeriod,
       lookback_days: lookbackDays,
+      lookback_start_days: lookbackStartDays,
       firewall: panoramaEntry,
     },
     { title: "Diagnose Flow", ...READ_ONLY },
-    async ({ device, device_group, destination, destination_port, protocol, src_ip, user, application, incident_time, period, lookback_days, firewall }) => {
+    async ({ device, device_group, destination, destination_port, protocol, src_ip, user, application, incident_time, period, lookback_days, lookback_start_days, firewall }) => {
       if (!src_ip && !user) throw new Error("Provide 'src_ip' and/or 'user'");
       const target = panoramaTarget(firewall);
       const findings: string[] = [];
       const out: Record<string, unknown> = {};
-      const { windows, backward } = timeWindows(incident_time, period, lookback_days);
+      const { windows, backward } = timeWindows(incident_time, period, lookback_days, lookback_start_days);
 
       if (!src_ip && user) {
         const identity = assertFullIdentity(user);

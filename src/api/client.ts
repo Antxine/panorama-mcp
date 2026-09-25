@@ -2,6 +2,7 @@ import { XMLParser } from "fast-xml-parser";
 import { fetch } from "undici";
 import { resolveFirewall, isMultiFirewall } from "../config/firewalls.js";
 import { buildDispatcher, describeProxy } from "./proxy.js";
+import { cancelled, remainingMs } from "../lib/budget.js";
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -158,12 +159,19 @@ export async function executeOpCommand(cmd: string, target?: FirewallTarget, dev
   }
 }
 
+/** Time kept for the tool's own work (config analysis) after its log queries. */
+const LOG_RESERVE_MS = 10_000;
+
 export async function executeLogQuery(
   logType: string,
   nlogs: number,
   query: string | undefined,
   target: FirewallTarget
 ): Promise<ApiResponse> {
+  if (remainingMs() < LOG_RESERVE_MS) {
+    return { success: false, error: "Log query skipped: no time left in this tool call (client timeout). Narrow the time window or add filters." };
+  }
+
   // Step 1: Submit log query (type=log)
   let url = `https://${target.host}/api/?type=log&log-type=${encodeURIComponent(logType)}&nlogs=${nlogs}`;
   if (query) {
@@ -192,8 +200,14 @@ export async function executeLogQuery(
   const maxAttempts = logTimeoutSeconds();
   const pollIntervalMs = 1000;
   let lastLogs: any;
+  let outOfBudget = false;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Stop before the client gives up on the tool call, or as soon as it cancels it.
+    if (remainingMs() < LOG_RESERVE_MS) {
+      outOfBudget = true;
+      break;
+    }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
 
     let pollResult: ApiResponse;
@@ -221,18 +235,24 @@ export async function executeLogQuery(
   if (lastLogs?.entry) return { success: true, data: lastLogs, partial: true };
   return {
     success: false,
-    error: `Log query timed out after ${maxAttempts} seconds (job ${jobId}). Narrow the time window (incident_time or a shorter period) or add filters (src_ip, user).`,
+    error: cancelled()
+      ? `Log query cancelled by the client (job ${jobId}).`
+      : outOfBudget
+        ? `Log query stopped to answer before the client timeout (job ${jobId}). Narrow the time window (incident_time) or add filters (src_ip, user).`
+        : `Log query timed out after ${maxAttempts} seconds (job ${jobId}). Narrow the time window (incident_time or a shorter period) or add filters (src_ip, user).`,
   };
 }
 
-export async function getConfig(xpath: string, target?: FirewallTarget): Promise<ApiResponse> {
+/** Reads config; with `deviceSerial`, Panorama proxies the request to that managed firewall. */
+export async function getConfig(xpath: string, target?: FirewallTarget, deviceSerial?: string): Promise<ApiResponse> {
   if (!target) {
     const resolved = resolveTarget();
     if (isApiError(resolved)) return resolved;
     target = resolved;
   }
 
-  const url = `https://${target.host}/api/?type=config&action=get&xpath=${encodeURIComponent(xpath)}`;
+  let url = `https://${target.host}/api/?type=config&action=get&xpath=${encodeURIComponent(xpath)}`;
+  if (deviceSerial) url += `&target=${encodeURIComponent(deviceSerial)}`;
 
   try {
     return await makeRequest(url, target.apiKey, target.verifySSL);

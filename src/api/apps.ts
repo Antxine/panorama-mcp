@@ -21,9 +21,10 @@ export interface AppContainer {
 }
 
 /** Predefined App-ID attributes, from Panorama's predefined config. */
-export async function predefinedApp(target: FirewallTarget, name: string): Promise<AppInfo | undefined> {
+/** Predefined App-ID from Panorama's content, or from a managed firewall's with `deviceSerial`. */
+export async function predefinedApp(target: FirewallTarget, name: string, deviceSerial?: string): Promise<AppInfo | undefined> {
   if (name.includes("'")) return undefined;
-  const result = await getConfig(`/config/predefined/application/entry[@name='${name}']`, target);
+  const result = await getConfig(`/config/predefined/application/entry[@name='${name}']`, target, deviceSerial);
   if (!result.success) {
     if (/not authorized/i.test(result.error ?? "")) throw new Error(explainApiError(result.error));
     return undefined;

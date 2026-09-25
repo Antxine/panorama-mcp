@@ -351,14 +351,31 @@ export function registerDebugTools(server: McpServer) {
       if (own.length) {
         return jsonResponse({ scope: scope.locations, definitions: own, rules_using_it: referencing([name]) });
       }
-      const app = await predefinedApp(target, name);
+      let app = await predefinedApp(target, name);
+      let contentNote: string | undefined;
       if (!app) {
-        return jsonResponse({ name, found: false, note: "Not an application group/filter in scope nor a predefined App-ID: may be a custom application (see get_config_xpath) or a typo." });
+        // Firewalls may run newer App-ID content than Panorama: the name on a block page comes from the firewall.
+        const pick = await pickDevice(target, { anyConnected: true }).catch(() => undefined);
+        app = pick ? await predefinedApp(target, name, pick.device.serial).catch(() => undefined) : undefined;
+        if (app && pick) {
+          contentNote =
+            `'${name}' is a predefined App-ID on firewall ${pick.device.hostname} but unknown to Panorama: Panorama's App-ID content is older than the firewalls'. ` +
+            "Rules on Panorama cannot reference it by name until Panorama's content is updated (Panorama > Dynamic Updates, same version as the firewalls). " +
+            "It is matched today through application filters (by category/subcategory/risk) or rules with application 'any'.";
+        }
+      }
+      if (!app) {
+        return jsonResponse({
+          name,
+          found: false,
+          note: "Not a custom application, application group or filter in any device group, nor a predefined App-ID on Panorama or a firewall: check the spelling (block page, logs).",
+        });
       }
       const inside = containersOf(app, containers);
       return jsonResponse({
         scope: scope.locations,
         app,
+        ...(contentNote ? { content_note: contentNote } : {}),
         contained_in: inside.map((c) => ({ kind: c.kind, name: c.name, location: c.location, definition: c.definition })),
         rules_referencing_app_or_containers: referencing([name, ...inside.map((c) => c.name)]),
       });

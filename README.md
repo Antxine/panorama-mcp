@@ -156,6 +156,12 @@ Override the path with `PANOS_ORG_NOTES=/custom/path.md`. The notes are appended
   Put a user's exception in the device group matching where they connect from.
 ```
 
+## Timeouts and caching
+
+MCP clients drop a request after about 60 seconds (GitHub Copilot CLI included). Each tool call therefore has a time budget (`PANOS_TOOL_BUDGET_SECONDS`, default 50): log jobs are stopped before it runs out and the backward log search returns what it found with a `lookback_start_days` value to resume. Client cancellations stop the running log jobs on Panorama.
+
+Config reads are cached for `PANOS_CONFIG_CACHE_SECONDS` (default 300, `0` disables), since a diagnosis reads the rules and objects of every device group several times. `PANOS_LOG_TIMEOUT` (default 120) still caps a single log job.
+
 ## Tool Categories
 
 | Category | Tools | Description |
